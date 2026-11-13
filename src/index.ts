@@ -25,6 +25,14 @@ import { realpathSync } from "fs";
 import { addScript, editScript } from "./gm/scripts.js";
 import { addObject, addObjectEvent, editObject } from "./gm/objects.js";
 import { addSpriteFromImages, editSprite } from "./gm/sprites.js";
+import {
+  listSpriteFrames,
+  addSpriteFrame,
+  removeSpriteFrame,
+  replaceSpriteFrame,
+  reorderSpriteFrames,
+  trimSpriteFrames,
+} from "./gm/sprite_frames.js";
 import { addRoom, editRoom, reorderRoom, moveRoomRelativeTo } from "./gm/rooms.js";
 import { addRoomInstance } from "./gm/instances.js";
 import { addShader, editShader } from "./gm/shaders.js";
@@ -43,6 +51,14 @@ import { lintProject } from "./gm/lint.js";
 import { compileProject } from "./gm/build.js";
 import { getRoomTileLayers, findTileRegion, getRoomTiles, setRoomTiles, fillRoomTiles } from "./gm/room_tiles.js";
 import { listRoomLayers, addRoomLayer, removeRoomLayer, setRoomLayer } from "./gm/room_layers.js";
+import { createSnapshot, listSnapshots, restoreSnapshot, deleteSnapshot, undoLast } from "./gm/snapshot.js";
+import { readFile, patchFile, listChanges } from "./gm/files.js";
+import { withAutoSnapshot } from "./gm/write.js";
+import { getProjectOptions, setProjectOption, OPTION_ALLOWLIST } from "./gm/options.js";
+import { listIncludedFiles, addIncludedFile, removeIncludedFile } from "./gm/included_files.js";
+import { listMacros, setMacro } from "./gm/macros.js";
+import { listTimelines } from "./gm/timelines.js";
+import { listSequences } from "./gm/sequences.js";
 
 // Schema definitions
 const EVENT_TYPE_DESCRIPTION =
@@ -53,6 +69,9 @@ const EVENT_NUM_DESCRIPTION =
   "Destroy, Draw) this is 0. For Alarm: which alarm, 0-11. For Step: 0=Step, 1=Begin Step, " +
   "2=End Step. For Collision: use 0 -- set collisionTargetName separately to specify the other " +
   "object. For Keyboard/KeyPress/KeyRelease: a virtual key code (e.g. vk_space=32, ord('A')=65).";
+const SKIP_SNAPSHOT_DESCRIPTION =
+  "Skip the automatic backup this tool otherwise takes in <projectDir>/.gm-forge/ (default false). " +
+  "Only for CI or a slow disk: a skipped snapshot means undo_last cannot bring this change back";
 
 const ProjectSchema = z.object({
   projectDir: z.string().describe("Absolute path to the GameMaker project directory"),
@@ -106,6 +125,7 @@ const EditScriptSchema = ProjectSchema.extend({
   scriptName: z.string().describe("Name of the existing script to edit"),
   code: z.string().describe("GML code to write"),
   mode: z.enum(["replace", "append"]).default("append").describe("replace overwrites the whole file; append adds to the end"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const AddObjectEventSchema = ProjectSchema.extend({
@@ -114,6 +134,7 @@ const AddObjectEventSchema = ProjectSchema.extend({
   eventNum: z.number().describe(EVENT_NUM_DESCRIPTION),
   collisionTargetName: z.string().optional().describe("For Collision events (eventType 4) only: name of the existing object this collides with"),
   code: z.string().default("// Event code here\n").describe("GML code for the new event"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const EditRoomSchema = ProjectSchema.extend({
@@ -121,6 +142,7 @@ const EditRoomSchema = ProjectSchema.extend({
   width: z.number().int().positive().optional().describe("New room width in pixels"),
   height: z.number().int().positive().optional().describe("New room height in pixels"),
   persistent: z.boolean().optional().describe("New persistent flag"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const ReorderRoomSchema = ProjectSchema.extend({
@@ -151,6 +173,7 @@ const AddRoomInstanceSchema = ProjectSchema.extend({
   rotation: z.number().default(0).describe("Instance rotation in degrees"),
   scaleX: z.number().default(1.0).describe("Horizontal scale"),
   scaleY: z.number().default(1.0).describe("Vertical scale"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const GetObjectInfoSchema = ProjectSchema.extend({
@@ -175,11 +198,161 @@ const EditSpriteSchema = ProjectSchema.extend({
   bbox_top: z.number().optional().describe("New bounding box top edge (used when bboxMode=2)"),
   bbox_right: z.number().optional().describe("New bounding box right edge (used when bboxMode=2)"),
   bbox_bottom: z.number().optional().describe("New bounding box bottom edge (used when bboxMode=2)"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+// --- Sprite frames (subproject B) ---
+// A frame is two pngs (the composite and the per-layer copy), so every writer
+// below rewrites the sprite .yy AND those image pairs; none of them draws,
+// resizes a multi-frame sprite, or touches the .yyp / texture group.
+
+// Disk-free argument refusals for the auto-snapshot hook. `frameCount` lives on
+// disk, so only the parts that do not need it are checked here -- but a call that
+// cannot be valid at all (a negative index, a repeated order entry, an inverted
+// trim range) must not pay for a project copy that is then kept as
+// `failed: true`. The module re-validates everything against the real sprite.
+const nonNegativeFrameIndex = (args: any): string | null =>
+  Number.isInteger(args?.index) && args.index >= 0 ? null : "index must be a 0-based frame index";
+
+// `index` is optional on add_sprite_frame (omitted = append), so only a present,
+// unusable value disqualifies the call.
+const optionalNonNegativeFrameIndex = (args: any): string | null =>
+  args?.index === undefined || (Number.isInteger(args.index) && args.index >= 0)
+    ? null
+    : "index must be a 0-based frame index (omit it to append)";
+
+const spriteFramePrevalidate: Record<string, (args: any) => string | null> = {
+  add_sprite_frame: optionalNonNegativeFrameIndex,
+  remove_sprite_frame: nonNegativeFrameIndex,
+  replace_sprite_frame: nonNegativeFrameIndex,
+  reorder_sprite_frames: (args: any) => {
+    const order = args?.order;
+    if (!Array.isArray(order) || order.length === 0) return "order must be a non-empty array of frame indices";
+    const seen = new Set<number>();
+    for (const value of order) {
+      if (!Number.isInteger(value) || value < 0) return "order must contain only 0-based frame indices";
+      if (seen.has(value)) return `order repeats the frame index ${value}`;
+      seen.add(value);
+    }
+    return null;
+  },
+  trim_sprite_frames: (args: any) =>
+    Number.isInteger(args?.from) && Number.isInteger(args?.to) && args.from >= 0 && args.from <= args.to
+      ? null
+      : "trim needs 0 <= from <= to",
+};
+
+// The two tools that delete frame pngs report what they could NOT delete rather
+// than throwing after the .yy was written. The warning goes out as a SECOND
+// content part so content[0] stays pure JSON (the same rule the auto-snapshot
+// hook follows for its own warnings).
+function spriteFrameResponse(result: { leftoverFiles?: string[] }): { content: Array<{ type: string; text: string }> } {
+  const content: Array<{ type: string; text: string }> = [{ type: "text", text: JSON.stringify(result, null, 2) }];
+  const leftovers = result.leftoverFiles ?? [];
+  if (leftovers.length > 0) {
+    content.push({
+      type: "text",
+      text:
+        `⚠ the sprite .yy no longer references ${leftovers.length} of these file(s), but they could not be deleted ` +
+        `(${leftovers.join(", ")}). Close the sprite in GameMaker (or wait for the antivirus scan) and remove them by hand: ` +
+        `the sprite still loads, the leftover is just unreferenced`,
+    });
+  }
+  return { content };
+}
+
+const FrameIndexDescription =
+  "0-based frame index, counted in the sprite's frames[] order. There is no last-frame shorthand: " +
+  "-1 is refused, and only the tools that say so treat an omitted index as append";
+
+const ListSpriteFramesSchema = ProjectSchema.extend({
+  spriteName: z.string().describe("Name of the existing sprite whose frame list and sequence to read"),
+});
+
+const AddSpriteFrameSchema = ProjectSchema.extend({
+  spriteName: z.string().describe("Name of the existing sprite to add a frame to"),
+  sourceImagePath: z
+    .string()
+    .describe(
+      "Absolute path to a PNG that is copied into the sprite verbatim (never moved, never re-encoded, never resized). " +
+        "Its pixel size must equal the sprite's current width x height, because GameMaker cannot load a sprite whose frames differ in size"
+    ),
+  index: z
+    .number()
+    .int()
+    .optional()
+    .describe(
+      `${FrameIndexDescription}. Omitted (or an index equal to the current frameCount) appends the frame at the end; ` +
+        "0..frameCount-1 inserts it before that frame and shifts the rest along. The new frame always gets a fresh guid"
+    ),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+const RemoveSpriteFrameSchema = ProjectSchema.extend({
+  spriteName: z.string().describe("Name of the existing sprite to remove a frame from"),
+  index: z
+    .number()
+    .int()
+    .describe(
+      `${FrameIndexDescription}. Removing the only frame is refused -- a zero-frame sprite cannot be loaded; delete the resource instead`
+    ),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+const ReplaceSpriteFrameSchema = ProjectSchema.extend({
+  spriteName: z.string().describe("Name of the existing sprite holding the frame to replace"),
+  index: z
+    .number()
+    .int()
+    .describe(
+      `${FrameIndexDescription}. The frame guid is kept, so every imageIndex a room already points at stays valid -- only the png bytes change`
+    ),
+  sourceImagePath: z
+    .string()
+    .describe("Absolute path to the replacement PNG; both of the frame's png copies are overwritten with its bytes"),
+  allowResize: z
+    .boolean()
+    .default(false)
+    .describe(
+      "false (default) refuses a source PNG whose size differs from the sprite's, naming both sizes and the frame index. " +
+        "true accepts the new size only on a single-frame sprite (it then rewrites a full-frame bbox to match); " +
+        "on a multi-frame sprite it is refused, because one frame at a different size makes the sprite unloadable"
+    ),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+const ReorderSpriteFramesSchema = ProjectSchema.extend({
+  spriteName: z.string().describe("Name of the existing sprite whose frames to permute"),
+  order: z
+    .array(z.number())
+    .describe(
+      "New frame order as 0-based source indices: order[k] is the index of the frame that becomes frame k. " +
+        "Must be a permutation of 0..frameCount-1 -- same length, every value an integer in range, no duplicates, no -1. " +
+        "The identity permutation [0,1,2,...] is a no-op that writes nothing"
+    ),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+const TrimSpriteFramesSchema = ProjectSchema.extend({
+  spriteName: z.string().describe("Name of the existing sprite to trim the frame list of"),
+  from: z
+    .number()
+    .int()
+    .describe(`${FrameIndexDescription}. First frame to KEEP (inclusive); must be 0 <= from <= to`),
+  to: z
+    .number()
+    .int()
+    .describe(
+      `${FrameIndexDescription}. Last frame to KEEP (inclusive); must be <= frameCount-1. ` +
+        "Trim keeps from..to and deletes everything outside it, so 0..frameCount-1 is a no-op"
+    ),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const GetScriptInfoSchema = ProjectSchema.extend({
   scriptName: z.string().describe("Name of the script to inspect"),
 });
+
 
 const AddShaderSchema = ProjectSchema.extend({
   shaderName: z.string().describe("Name of the shader to create"),
@@ -195,6 +368,7 @@ const EditShaderSchema = ProjectSchema.extend({
   shaderName: z.string().describe("Name of the existing shader to edit"),
   vertexCode: z.string().optional().describe("New vertex shader GLSL ES code"),
   fragmentCode: z.string().optional().describe("New fragment shader GLSL ES code"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const AddSoundSchema = ProjectSchema.extend({
@@ -212,6 +386,7 @@ const EditSoundSchema = ProjectSchema.extend({
   soundName: z.string().describe("Name of the existing sound to edit"),
   volume: z.number().min(0).max(1).optional().describe("New playback volume (0-1)"),
   preload: z.boolean().optional().describe("New preload flag"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const AddFontSchema = ProjectSchema.extend({
@@ -232,6 +407,7 @@ const EditFontSchema = ProjectSchema.extend({
   size: z.number().positive().optional().describe("New font size in points"),
   bold: z.boolean().optional().describe("New bold style"),
   italic: z.boolean().optional().describe("New italic style"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const AddTilesetSchema = ProjectSchema.extend({
@@ -257,6 +433,7 @@ const EditTilesetSchema = ProjectSchema.extend({
   tilevsep: z.number().int().nonnegative().optional().describe("New vertical spacing between tiles, in pixels"),
   tilexoff: z.number().int().nonnegative().optional().describe("New horizontal offset before the first tile, in pixels"),
   tileyoff: z.number().int().nonnegative().optional().describe("New vertical offset before the first tile, in pixels"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const AddExtensionSchema = ProjectSchema.extend({
@@ -299,12 +476,14 @@ const DeleteResourceSchema = ProjectSchema.extend({
   category: ResourceCategoryEnum.describe("Resource category (rooms/objects/scripts/sprites/shaders/sounds/fonts/notes/tilesets/extensions/particles/animcurves)"),
   resourceName: z.string().describe("Name of the resource to delete"),
   force: z.boolean().default(false).describe("Delete even if still referenced elsewhere in the project"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const RenameResourceSchema = ProjectSchema.extend({
   category: ResourceCategoryEnum.describe("Resource category (rooms/objects/scripts/sprites/shaders/sounds/fonts/notes/tilesets/extensions/particles/animcurves)"),
   oldName: z.string().describe("Current name of the resource"),
   newName: z.string().describe("New name for the resource"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const ListResourcesSchema = ProjectSchema.extend({
@@ -358,6 +537,7 @@ const EditObjectSchema = ProjectSchema.extend({
     .nullable()
     .optional()
     .describe("Object variable definitions; [] or null empties the list, omitted leaves it unchanged"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const ListRoomLayersSchema = ProjectSchema.extend({
@@ -386,6 +566,7 @@ const AddRoomLayerSchema = ProjectSchema.extend({
   vspeed: z.number().optional().describe("Background layers: vertical scroll speed (default 0.0)"),
   x: z.number().optional().describe("Background layers: layer X offset in pixels (default 0)"),
   y: z.number().optional().describe("Background layers: layer Y offset in pixels (default 0)"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 }).refine(v => v.layerType !== "tile" || v.tilesetName !== undefined, {
   message: "layerType \"tile\" requires tilesetName -- create one with add_tileset first",
   path: ["tilesetName"],
@@ -395,6 +576,7 @@ const RemoveRoomLayerSchema = ProjectSchema.extend({
   roomName: z.string().describe("Name of the existing room to remove the layer from"),
   layerName: z.string().describe("Name of the layer to remove"),
   force: z.boolean().default(false).describe("Delete even if the layer still holds elements or sub-layers (default false refuses)"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const SetRoomLayerSchema = ProjectSchema.extend({
@@ -402,6 +584,7 @@ const SetRoomLayerSchema = ProjectSchema.extend({
   layerName: z.string().describe("Name of the layer to change (layers cannot be renamed -- GameMaker resolves them by name at runtime)"),
   visible: z.boolean().optional().describe("New visibility"),
   depth: z.number().int().optional().describe("New depth; higher draws further back"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const GetRoomTilesSchema = ProjectSchema.extend({
@@ -425,6 +608,7 @@ const SetRoomTilesSchema = ProjectSchema.extend({
       })
     )
     .describe("Cells to write; each cell is validated before anything is written"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
 const FillRoomTilesSchema = ProjectSchema.extend({
@@ -435,6 +619,142 @@ const FillRoomTilesSchema = ProjectSchema.extend({
   width: z.number().int().positive().describe("Rectangle width in cells; must stay inside the layer"),
   height: z.number().int().positive().describe("Rectangle height in cells; must stay inside the layer"),
   index: z.number().int().min(-1).describe("Tile index to fill with; -1 clears the rectangle"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+// --- Safety (subproject E) ---
+
+const CreateSnapshotSchema = ProjectSchema.extend({
+  reason: z
+    .string()
+    .max(500)
+    .optional()
+    .describe("Free-text note stored in the snapshot's manifest, never interpreted (max 500 chars)"),
+});
+
+const RestoreSnapshotSchema = ProjectSchema.extend({
+  snapshotId: z.string().describe("Snapshot id from list_snapshots, shaped <YYYYMMDD>-<HHmmss>-<6 hex>"),
+  files: z
+    .array(z.string())
+    .optional()
+    .describe("Project-relative paths to restore (omit for the whole snapshot). Every path must be in the snapshot's manifest; one unknown path restores nothing. Paths the snapshot skipped (over the per-file size cap, or a symlink) are reported in missingFromSnapshot instead"),
+});
+
+const DeleteSnapshotSchema = ProjectSchema.extend({
+  snapshotId: z.string().describe("Snapshot id from list_snapshots. The snapshot undo_last would currently restore is refused"),
+});
+
+const ReadFileSchema = ProjectSchema.extend({
+  path: z
+    .string()
+    .describe("Project-relative file path (e.g. objects/obj_player/Create_0.gml). Absolute paths, drive letters and anything resolving outside the project are refused"),
+  offset: z.number().int().positive().optional().describe("1-based first line to return (default 1)"),
+  limit: z.number().int().positive().optional().describe("Number of lines to return (default 2000, capped at 5000)"),
+});
+
+const PatchFileSchema = ProjectSchema.extend({
+  path: z
+    .string()
+    .describe("Project-relative file path of an existing file. A path inside .gm-forge/ is refused, and so is anything resolving outside the project"),
+  find: z
+    .string()
+    .min(1)
+    .describe("Literal text to find -- never a regular expression or a pattern, so regex metacharacters match themselves"),
+  replace: z.string().describe("Literal replacement text; an empty string deletes the match. Line endings are normalised to the file's own"),
+  count: z
+    .enum(["exact", "all"])
+    .default("exact")
+    .describe("exact (default) succeeds only when find occurs exactly once; all replaces every non-overlapping occurrence. Writes nothing in either case if find occurs zero times"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+// --- Project config (subproject C) ---
+
+const PLATFORM_DESCRIPTION =
+  "Options platform directory name: android, html5, ios, linux, mac, main, operagx, reddit, tvos or windows. " +
+  "The display name from the options file (\"macOS\", \"Opera GX\", \"HTML5\") is accepted too. " +
+  "A platform this project has no options/ directory for is an error -- these tools never create one";
+
+const GetProjectOptionsSchema = ProjectSchema.extend({
+  platform: z.string().optional().describe(`Omitted reads every options/*/options_*.yy in the project, sorted by platform. ${PLATFORM_DESCRIPTION}`),
+});
+
+// `key` is a plain string on purpose: the writable set depends on the platform
+// (option_resize exists on windows and linux, not on reddit) and on the
+// GameMaker version, and three of the rejected names have to reach the module to
+// get their own reason ("read-only" / "unverified: no GameMaker 2026.0.0.16
+// sample defines this key"). A z.enum would turn both into one zod message.
+const SET_PROJECT_OPTION_KEY_DESCRIPTION =
+  "Logical option name. Writable (the module resolves the real on-disk spelling, e.g. " +
+  `option_<platform>_interpolate_pixels): ${OPTION_ALLOWLIST.filter(s => s.status === "verified").map(s => s.key).join(", ")}. ` +
+  `Rejected with its own reason: ${OPTION_ALLOWLIST.filter(s => s.status !== "verified").map(s => `${s.key} (${s.status})`).join(", ")}`;
+
+const SetProjectOptionSchema = ProjectSchema.extend({
+  platform: z.string().optional().describe(`Defaults to "main", the project-wide options file. ${PLATFORM_DESCRIPTION}`),
+  key: z.string().describe(SET_PROJECT_OPTION_KEY_DESCRIPTION),
+  value: z
+    .union([z.boolean(), z.number(), z.string()])
+    .describe("New value, typed by the option: bool options need true/false, int options a whole number, string options a string. Type is checked before anything is written"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+const ListIncludedFilesSchema = ProjectSchema.extend({});
+
+const AddIncludedFileSchema = ProjectSchema.extend({
+  sourcePath: z
+    .string()
+    .describe("File to register. With copy (the default) an absolute path or a project-relative one; with copy: false it must already live inside the project"),
+  targetName: z
+    .string()
+    .optional()
+    .describe("Directory under datafiles/ the file is copied into -- one path segment, no separators. Defaults to the basename without its extension (assets/manifest.json -> datafiles/manifest/)"),
+  copy: z
+    .boolean()
+    .optional()
+    .describe("true (default) copies the file to datafiles/<targetName>/<basename> and registers it there; false registers the source in place, which must be inside the project"),
+  overwrite: z
+    .boolean()
+    .optional()
+    .describe("Replace an existing IncludedFiles entry with the same name (in place, keeping its extra keys) and an existing destination file, instead of refusing"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+const RemoveIncludedFileSchema = ProjectSchema.extend({
+  name: z.string().describe("Name of the registered included file (the basename with its extension, as list_included_files reports it)"),
+  deleteFile: z
+    .boolean()
+    .optional()
+    .describe("false (default) only unregisters the entry. true also deletes the file, and the datafiles/ directory if that leaves it empty -- never when another entry still references the same path"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+const ListMacrosSchema = ProjectSchema.extend({});
+
+const SetMacroSchema = ProjectSchema.extend({
+  name: z.string().describe("Macro name -- a GML identifier, matched case-sensitively"),
+  value: z.string().describe("Replacement value: one line, no bare trailing // (it would read back as a comment)"),
+  file: z
+    .string()
+    .optional()
+    .describe("Project-relative .gml file to write. Defaults to scripts/macros/macros.gml, which is the only file this tool ever creates; an existing file elsewhere can be updated by naming it"),
+  skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
+});
+
+// Read-only. Timelines and sequences have no writer here: no GameMaker-generated
+// file of either type exists on this machine to capture a shape from, so a writer
+// would be a guess the IDE rejects (docs/specs/D-sequences-timelines.md).
+const ListTimelinesSchema = ProjectSchema.extend({
+  timelineName: z
+    .string()
+    .optional()
+    .describe("Name of one timeline to summarise. Omit to list every timeline the .yyp registers"),
+});
+
+const ListSequencesSchema = ProjectSchema.extend({
+  sequenceName: z
+    .string()
+    .optional()
+    .describe("Name of one sequence to summarise. Omit to list every sequence the .yyp registers, plus the count of sequences embedded in sprites"),
 });
 
 // Create MCP server instance
@@ -458,6 +778,13 @@ interface ToolDef {
   name: string;
   description: string;
   schema: z.ZodType;
+  /**
+   * Optional disk-free argument check used by the auto-snapshot hook: returning a
+   * message means "this call cannot be valid, do not spend a project copy on it".
+   * The handler still runs and throws its own error, so there is one copy of
+   * every validation rule.
+   */
+  prevalidate?: (args: any) => string | null;
 }
 
 const TOOL_DEFS: ToolDef[] = [
@@ -489,6 +816,12 @@ const TOOL_DEFS: ToolDef[] = [
   { name: "fill_room_tiles", description: "Fill an axis-aligned rectangle of a tile layer with one tile index, inclusive of its origin cell. Rectangles that run past the layer are errors, not silent clips.", schema: FillRoomTilesSchema },
   { name: "get_sprite_info", description: "Get detailed info about an existing sprite: real dimensions, frame count, origin, collision settings", schema: GetSpriteInfoSchema },
   { name: "edit_sprite", description: "Edit an existing sprite's origin, collision kind, and/or bounding box -- not its frame data", schema: EditSpriteSchema },
+  { name: "list_sprite_frames", description: "Read a sprite's frame list and its frames sequence: per-frame guid, png path and whether both copies exist, plus the sequence length, playback speed, keyframe count and a verdict (\"ok\" or \"frames-vs-sequence mismatch: N vs M\"). Read-only -- it reports a broken sprite instead of repairing it", schema: ListSpriteFramesSchema },
+  { name: "add_sprite_frame", description: "Append or insert one frame from a PNG on disk (omitted index appends, 0..frameCount-1 inserts before that frame). The PNG must match the sprite's size -- there is no resize and no pixel editing -- and the new frame gets a fresh guid plus both png copies GameMaker expects. Never touches the .yyp or texture group", schema: AddSpriteFrameSchema, prevalidate: spriteFramePrevalidate.add_sprite_frame },
+  { name: "remove_sprite_frame", description: "Remove one frame and delete both of its png copies, renumbering the remaining keyframes. Refuses the only frame of a sprite (delete the resource instead). Not a pixel edit: nothing else in the sprite changes", schema: RemoveSpriteFrameSchema, prevalidate: spriteFramePrevalidate.remove_sprite_frame },
+  { name: "replace_sprite_frame", description: "Replace one frame's image in place, keeping its guid so every room imageIndex stays valid. The source PNG must match the sprite's size unless allowResize is set, which only works on a single-frame sprite. Image bytes only -- no pixel editing, no bbox/origin change beyond a full-frame default following an allowResize", schema: ReplaceSpriteFrameSchema, prevalidate: spriteFramePrevalidate.replace_sprite_frame },
+  { name: "reorder_sprite_frames", description: "Permute a sprite's frames with an order array that must be a permutation of 0..frameCount-1; each keyframe travels with its frame, so no guid or keyframe id is regenerated. The identity permutation writes nothing. No packing, no drawing", schema: ReorderSpriteFramesSchema, prevalidate: spriteFramePrevalidate.reorder_sprite_frames },
+  { name: "trim_sprite_frames", description: "Keep the inclusive frame range from..to and delete the frames outside it (both png copies each), the usual cleanup after importing a strip that begins with padding frames. The full range 0..frameCount-1 is a no-op. Not a strip importer and not a splitter", schema: TrimSpriteFramesSchema, prevalidate: spriteFramePrevalidate.trim_sprite_frames },
   { name: "get_script_info", description: "Get an existing script's current GML code", schema: GetScriptInfoSchema },
   { name: "add_shader", description: "Create a new vertex+fragment shader pair (GLSL ES) and register it in the project", schema: AddShaderSchema },
   { name: "get_shader_info", description: "Get an existing shader's vertex and fragment code", schema: GetShaderInfoSchema },
@@ -514,6 +847,23 @@ const TOOL_DEFS: ToolDef[] = [
   { name: "lint_project", description: "Validate a whole project for dangling references, orphaned resources, missing folder registrations, missing event code files, and sound/sprite metadata that doesn't match the real underlying file -- run this before trusting a project is safe to open", schema: ProjectSchema },
   { name: "compile_project", description: "Actually compile the project with GameMaker's real build tool (Igor) to catch real GML errors -- duplicate function names, syntax errors -- that structural checks like lint_project can't see. NOTE: a successful compile briefly LAUNCHES the built game (then kills it immediately), so the project's own code runs; only compile projects you trust. Requires the GameMaker runtime to be installed (skips gracefully with a clear message if not). Windows only.", schema: ProjectSchema },
   { name: "list_resources", description: "List resource names by type from the YYP file", schema: ListResourcesSchema },
+  { name: "create_snapshot", description: "Back up the whole project into <projectDir>/.gm-forge/backups/ and return its snapshot id. Refuses (rather than writing a partial backup) when the project is over the snapshot size limits. Snapshots are plain files, never a git operation", schema: CreateSnapshotSchema },
+  { name: "list_snapshots", description: "List the snapshots in <projectDir>/.gm-forge/backups/, newest first, with the tool that made each one and whether it has already been undone. A corrupt manifest is reported inline instead of failing the listing. totalBytes is logical size: identical files may share disk space", schema: ProjectSchema },
+  { name: "restore_snapshot", description: "Restore files from a snapshot, either the whole snapshot or a list of project-relative paths. Every stored file is checked against its recorded sha256 first, so a corrupted snapshot fails without changing anything. This is not a redo point: create_snapshot first if you want one. Close GameMaker before restoring -- it holds .yy files open and saves over restores silently", schema: RestoreSnapshotSchema },
+  { name: "delete_snapshot", description: "Delete one snapshot directory. The snapshot undo_last would currently restore is refused, as is any id that does not resolve inside the store", schema: DeleteSnapshotSchema },
+  { name: "read_file", description: "Read any text file in the project (.gml, .yy, .yyp, .json, notes) with 1-based line numbers, 'N: ' prefixed, so a follow-up can name an exact line. Pages by lines with offset/limit; refuses binary/UTF-16 files, directories, and files over 2 MiB", schema: ReadFileSchema },
+  { name: "patch_file", description: "Replace literal text in an existing project file and back it up first. Matching is exact-string (no regex, no fuzzy match), and the call writes nothing unless find occurs exactly once, or at least once with count: \"all\". The file's line endings, BOM and trailing newline are preserved. JSON is not validated afterwards -- run lint_project to check the result", schema: PatchFileSchema },
+  { name: "list_changes", description: "Compare the project on disk against the newest snapshot: files added, modified or deleted since it was taken, plus how many large files snapshots do not cover. Files whose size and mtime both match are not re-hashed", schema: ProjectSchema },
+  { name: "undo_last", description: "Revert the files the most recent un-undone operation touched, deleting files it created. Safe to call repeatedly: each call peels one operation, and it says so when there is nothing left to undo", schema: ProjectSchema },
+  { name: "get_project_options", description: "Read the project's options/*/options_*.yy files as plain option_* maps with the GameMaker envelope stripped. Read-only; omit platform for all of them. This is the before/after evidence for set_project_option", schema: GetProjectOptionsSchema },
+  { name: "set_project_option", description: "Change one project option (the interpolate_pixels switch behind pixel-art fringing, game speed, author, per-platform scale/fullscreen/resize/version) in place, rewriting only that line. Only the curated, captured allowlist is writable; unknown, read-only (option_gameguid) and unverified names are refused with the reason, and a key GameMaker did not write is never added. A file where the option is not on its own line is refused rather than reformatted, and the result reports the backup it took (snapshotId) or why it took none", schema: SetProjectOptionSchema },
+  { name: "list_included_files", description: "List the project's IncludedFiles (the files GameMaker ships as data, from the .yyp) in the order GameMaker stored them, flagging any registered entry whose file is missing from disk", schema: ListIncludedFilesSchema },
+  { name: "add_included_file", description: "Register a data file in the project's IncludedFiles, copying it to datafiles/<targetName>/ by default, and refuse a duplicate name, an occupied destination, or a path that would leave the project", schema: AddIncludedFileSchema },
+  { name: "remove_included_file", description: "Unregister an IncludedFiles entry by name, leaving the file on disk unless deleteFile: true (unregistering must not silently delete user data)", schema: RemoveIncludedFileSchema },
+  { name: "list_macros", description: "Index every #macro definition in the project's .gml files with file and line, including the duplicate names GameMaker silently resolves to the last definition. A #macro inside a /* */ block comment is not a definition. Skips the snapshot/backup, output, datafiles and options directories", schema: ListMacrosSchema },
+  { name: "set_macro", description: "Set a #macro to a value, creating scripts/macros/macros.gml (plus its script resource and folder node) when nothing defines it yet, or rewriting exactly that one line in place. Never creates a second definition of a name that already exists, never writes into output/, datafiles/ or options/, and reports changed: false plus the backup it took (snapshotId) or skipped", schema: SetMacroSchema },
+  { name: "list_timelines", description: "List the timelines the .yyp registers with each one's moment count, per-moment step and whether it carries code. Read-only, and tolerant by construction: it reports the moments key it found (or the root keys the file actually has) instead of a confident zero, and a file it cannot read or parse is reported in that entry's parseError rather than failing the listing. Field names are provisional -- no GameMaker-authored timeline exists on this machine to confirm them. There is no timeline writer: a shape guessed at this depth would be rejected by the IDE, not by us", schema: ListTimelinesSchema },
+  { name: "list_sequences", description: "List the sequences the .yyp registers with length, playback speed, track count and each track's verbatim type and keyframe count, plus how many sequences are embedded in sprites' own .yy files. Read-only, and tolerant by construction: a track type it has never seen still lists, and a file it cannot parse is reported in that entry's parseError rather than failing the listing. There is no sequence writer -- only sprite-embedded GMSequences exist on this machine, which the gate in docs/specs/D-sequences-timelines.md rules insufficient", schema: ListSequencesSchema },
 ];
 
 function toInputSchema(schema: z.ZodType): Tool["inputSchema"] {
@@ -815,6 +1165,42 @@ async function dispatchTool(name: string, args: unknown) {
         return { content: [{ type: "text", text: `✓ Sprite "${spriteName}" updated` }] };
       }
 
+      case "list_sprite_frames": {
+        const { projectDir, spriteName } = ListSpriteFramesSchema.parse(args);
+        const result = await listSpriteFrames(projectDir, spriteName);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "add_sprite_frame": {
+        const { projectDir, spriteName, sourceImagePath, index } = AddSpriteFrameSchema.parse(args);
+        const result = await addSpriteFrame(projectDir, spriteName, sourceImagePath, index);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "remove_sprite_frame": {
+        const { projectDir, spriteName, index } = RemoveSpriteFrameSchema.parse(args);
+        const result = await removeSpriteFrame(projectDir, spriteName, index);
+        return spriteFrameResponse(result);
+      }
+
+      case "replace_sprite_frame": {
+        const { projectDir, spriteName, index, sourceImagePath, allowResize } = ReplaceSpriteFrameSchema.parse(args);
+        const result = await replaceSpriteFrame(projectDir, spriteName, index, sourceImagePath, allowResize);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "reorder_sprite_frames": {
+        const { projectDir, spriteName, order } = ReorderSpriteFramesSchema.parse(args);
+        const result = await reorderSpriteFrames(projectDir, spriteName, order);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "trim_sprite_frames": {
+        const { projectDir, spriteName, from, to } = TrimSpriteFramesSchema.parse(args);
+        const result = await trimSpriteFrames(projectDir, spriteName, from, to);
+        return spriteFrameResponse(result);
+      }
+
       case "get_script_info": {
         const { projectDir, scriptName } = GetScriptInfoSchema.parse(args);
         const info = await getScriptInfo(projectDir, scriptName);
@@ -1012,18 +1398,148 @@ async function dispatchTool(name: string, args: unknown) {
         };
       }
 
+      case "create_snapshot": {
+        const { projectDir, reason } = CreateSnapshotSchema.parse(args);
+        const result = await createSnapshot(projectDir, { reason, tool: "create_snapshot" });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "list_snapshots": {
+        const { projectDir } = ProjectSchema.parse(args);
+        const result = await listSnapshots(projectDir);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "restore_snapshot": {
+        const { projectDir, snapshotId, files } = RestoreSnapshotSchema.parse(args);
+        const result = await restoreSnapshot(projectDir, { snapshotId, files });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "delete_snapshot": {
+        const { projectDir, snapshotId } = DeleteSnapshotSchema.parse(args);
+        const result = await deleteSnapshot(projectDir, snapshotId);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "read_file": {
+        const { projectDir, path: filePath, offset, limit } = ReadFileSchema.parse(args);
+        const result = await readFile(projectDir, filePath, { offset, limit });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "patch_file": {
+        const { projectDir, path: filePath, find, replace, count, skipSnapshot } = PatchFileSchema.parse(args);
+        const result = await patchFile(projectDir, filePath, { find, replace, count, skipSnapshot });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "list_changes": {
+        const { projectDir } = ProjectSchema.parse(args);
+        const result = await listChanges(projectDir);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "undo_last": {
+        const { projectDir } = ProjectSchema.parse(args);
+        const result = await undoLast(projectDir);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "get_project_options": {
+        const { projectDir, platform } = GetProjectOptionsSchema.parse(args);
+        const result = await getProjectOptions(projectDir, { platform });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "set_project_option": {
+        const { projectDir, platform, key, value, skipSnapshot } = SetProjectOptionSchema.parse(args);
+        const result = await setProjectOption(projectDir, { platform, key, value, skipSnapshot });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "list_included_files": {
+        const { projectDir } = ListIncludedFilesSchema.parse(args);
+        const result = await listIncludedFiles(projectDir);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "add_included_file": {
+        const { projectDir, sourcePath, targetName, copy, overwrite } = AddIncludedFileSchema.parse(args);
+        const result = await addIncludedFile(projectDir, { sourcePath, targetName, copy, overwrite });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "remove_included_file": {
+        const { projectDir, name, deleteFile } = RemoveIncludedFileSchema.parse(args);
+        const result = await removeIncludedFile(projectDir, { name, deleteFile });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "list_macros": {
+        const { projectDir } = ListMacrosSchema.parse(args);
+        const result = await listMacros(projectDir);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "set_macro": {
+        const { projectDir, name, value, file, skipSnapshot } = SetMacroSchema.parse(args);
+        const result = await setMacro(projectDir, { name, value, file, skipSnapshot });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "list_timelines": {
+        const { projectDir, timelineName } = ListTimelinesSchema.parse(args);
+        const result = await listTimelines(projectDir, { name: timelineName });
+        const payload = result.kind === "one" ? result.timeline : result.timelines;
+        const content: any[] = [{ type: "text", text: JSON.stringify(payload, null, 2) }];
+        // A note is a second content part, like every other warning in this
+        // server: content[0] stays parseable JSON.
+        if (result.note !== null) content.push({ type: "text", text: `⚠ ${result.note}` });
+        return { content };
+      }
+
+      case "list_sequences": {
+        const { projectDir, sequenceName } = ListSequencesSchema.parse(args);
+        const result = await listSequences(projectDir, { name: sequenceName });
+        const payload = result.kind === "one"
+          ? result.sequence
+          : { sequences: result.sequences, spriteEmbeddedSequenceCount: result.spriteEmbedded.count };
+        const content: any[] = [{ type: "text", text: JSON.stringify(payload, null, 2) }];
+        if (result.note !== null) content.push({ type: "text", text: `⚠ ${result.note}` });
+        return { content };
+      }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
 }
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+// The one place a tool call becomes a text response: the project lock wraps the
+// auto-snapshot wrapper, which wraps the dispatch. Every destructive tool is
+// therefore backed up inside the same lock, before its handler runs, and no
+// handler body contains snapshot code.
+async function callTool(name: string, args: unknown) {
   const projectDir = (args as any)?.projectDir;
+  const def = TOOL_DEFS.find((d) => d.name === name);
 
   try {
     return typeof projectDir === "string"
-      ? await withProjectLock(projectDir, () => dispatchTool(name, args))
+      ? await withProjectLock(projectDir, () =>
+          withAutoSnapshot(
+            name,
+            projectDir,
+            args,
+            () => dispatchTool(name, args),
+            // The registered schema (plus its disk-free prevalidation), not a
+            // second copy: a malformed call is dispatched straight away so
+            // dispatch throws its own error and no project copy is spent on a
+            // call that cannot write.
+            def
+              ? { safeParse: (value: unknown) => def.schema.safeParse(value), prevalidate: def.prevalidate }
+              : undefined
+          )
+        )
       : await dispatchTool(name, args);
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1037,6 +1553,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       isError: true,
     };
   }
+}
+
+server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  return callTool(request.params.name, request.params.arguments);
 });
 
 // Start server
@@ -1069,7 +1589,7 @@ function isEntryPoint(): boolean {
   }
 }
 
-export { TOOL_DEFS, ObjectPhysicsSchema, EditObjectSchema, AddRoomLayerSchema, dispatchTool };
+export { TOOL_DEFS, ObjectPhysicsSchema, EditObjectSchema, AddRoomLayerSchema, dispatchTool, callTool };
 
 if (isEntryPoint()) {
   main().catch((error) => {

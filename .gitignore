@@ -5,3 +5,6 @@ dist/
 *.tsbuildinfo
 # Interrupted atomic writes (writeRoomYy/writeYyp leave .<name>.tmp-<uuid> behind)
 .*.tmp-*
+# Snapshot store the MCP server creates inside a project (only ever in scratch
+# projects here, but a stray run must not be committable)
+.gm-forge/
