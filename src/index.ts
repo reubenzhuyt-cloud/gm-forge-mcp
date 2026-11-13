@@ -20,8 +20,10 @@ import {
   fileExists,
 } from "./gm/yyp.js";
 import path from "path";
+import { fileURLToPath } from "url";
+import { realpathSync } from "fs";
 import { addScript, editScript } from "./gm/scripts.js";
-import { addObject, addObjectEvent } from "./gm/objects.js";
+import { addObject, addObjectEvent, editObject } from "./gm/objects.js";
 import { addSpriteFromImages, editSprite } from "./gm/sprites.js";
 import { addRoom, editRoom, reorderRoom, moveRoomRelativeTo } from "./gm/rooms.js";
 import { addRoomInstance } from "./gm/instances.js";
@@ -39,7 +41,8 @@ import { deleteResource } from "./gm/delete.js";
 import { renameResource } from "./gm/rename.js";
 import { lintProject } from "./gm/lint.js";
 import { compileProject } from "./gm/build.js";
-import { getRoomTileLayers, findTileRegion } from "./gm/room_tiles.js";
+import { getRoomTileLayers, findTileRegion, getRoomTiles, setRoomTiles, fillRoomTiles } from "./gm/room_tiles.js";
+import { listRoomLayers, addRoomLayer, removeRoomLayer, setRoomLayer } from "./gm/room_layers.js";
 
 // Schema definitions
 const EVENT_TYPE_DESCRIPTION =
@@ -311,6 +314,129 @@ const ListResourcesSchema = ProjectSchema.extend({
     .describe("Type of resources to list (optional)"),
 });
 
+const ObjectPhysicsSchema = z.object({
+  enabled: z.boolean().optional().describe("Turn physics on (true) or reset every physics field below to GameMaker's defaults (false). Omitted leaves it alone"),
+  density: z.number().optional().describe("Physics density (physicsDensity)"),
+  friction: z.number().optional().describe("Physics friction (physicsFriction)"),
+  restitution: z.number().optional().describe("Physics restitution/bounciness (physicsRestitution)"),
+  collisionGroup: z.number().int().optional().describe("Physics collision group (physicsGroup)"),
+  kinematic: z.boolean().optional().describe("Whether the object is kinematic (physicsKinematic)"),
+  sensor: z.boolean().optional().describe("Whether the object is a sensor (physicsSensor)"),
+  shape: z.number().int().optional().describe("Physics collision shape (physicsShape; 1=circle, 2=box, 3=convex/concave points)"),
+  startAwake: z.boolean().optional().describe("Whether the object starts awake (physicsStartAwake)"),
+  angularDamping: z.number().optional().describe("Angular damping (physicsAngularDamping)"),
+  linearDamping: z.number().optional().describe("Linear damping (physicsLinearDamping)"),
+  gravityScale: z
+    .number()
+    .optional()
+    .describe("NOT SUPPORTED: a GMObject .yy has no gravity-scale key (GameMaker keeps gravity per room instance), so there is nothing to write -- passing this is an error, not a silently dropped field"),
+}).refine(v => v.gravityScale === undefined, {
+  message: "physics.gravityScale cannot be stored: a GMObject .yy has no gravity-scale key (GameMaker keeps gravity per room instance)",
+  path: ["gravityScale"],
+});
+
+const VariableDefinitionSchema = z.object({
+  name: z.string().describe("Variable name as declared in the object's Variable Definitions panel"),
+  value: z.string().describe("Initial value as written in the panel (strings are unquoted)"),
+  type: z
+    .enum(["real", "asset"])
+    .default("real")
+    .describe("value type: \"real\" (varType 0) or \"asset\" (varType 4). Only these two have a verified .yy encoding, so any other type is rejected rather than guessed at"),
+});
+
+const EditObjectSchema = ProjectSchema.extend({
+  objectName: z.string().describe("Name of the existing object to edit"),
+  spriteName: z.string().nullable().optional().describe("Sprite to assign; null clears the sprite, omitted leaves it unchanged. The sprite must already exist"),
+  spriteMaskName: z.string().nullable().optional().describe("Collision-mask sprite to assign; null clears it (falls back to the sprite's own mask), omitted leaves it unchanged"),
+  parentObjectName: z.string().nullable().optional().describe("Parent object to assign; null clears the parent, omitted leaves it unchanged"),
+  solid: z.boolean().optional().describe("Solid flag"),
+  visible: z.boolean().optional().describe("Visible flag"),
+  persistent: z.boolean().optional().describe("Persistent flag (survives room changes)"),
+  physics: ObjectPhysicsSchema.optional().describe("Physics settings; each field is optional and maps onto GameMaker's physics* keys"),
+  variableDefinitions: z
+    .array(VariableDefinitionSchema)
+    .nullable()
+    .optional()
+    .describe("Object variable definitions; [] or null empties the list, omitted leaves it unchanged"),
+});
+
+const ListRoomLayersSchema = ProjectSchema.extend({
+  roomName: z.string().describe("Name of the existing room to inspect"),
+});
+
+const AddRoomLayerSchema = ProjectSchema.extend({
+  roomName: z.string().describe("Name of the existing room to add the layer to"),
+  layerName: z.string().describe("Free-text layer name, as GameMaker's editor allows it (spaces and hyphens are fine). It must be unique in the room, non-empty, at most 255 characters, and cannot contain \"/\", \"\\\", \":\" or \".\""),
+  layerType: z
+    .enum(["instance", "asset", "tile", "path", "background", "effect", "folder"])
+    .describe("Layer kind to create: instance, asset, tile, path, background, effect, or folder"),
+  depth: z.number().int().optional().describe("Layer depth; higher draws further back. Omitted = 100 behind the room's deepest existing layer"),
+  visible: z.boolean().default(true).describe("Whether the layer starts visible (default true)"),
+  parentLayerName: z.string().optional().describe("Name of an existing folder layer to nest this one inside; omitted adds it at the top level"),
+  tilesetName: z.string().optional().describe("Required for layerType \"tile\": the existing tile set whose tile size sizes the layer's grid"),
+  spriteName: z.string().optional().describe("For layerType \"asset\": an existing sprite to place as the layer's single graphic"),
+  color: z.number().int().optional().describe("Colour as an ABGR integer (background layers default to opaque black 4278190080; asset/path layers to 4294967295)"),
+  tiled: z.boolean().optional().describe("Background layers: tile the sprite both horizontally and vertically"),
+  stretch: z.boolean().optional().describe("Background layers: stretch the sprite to the room"),
+  horizontalTile: z.boolean().optional().describe("Background layers: tile the sprite horizontally"),
+  verticalTile: z.boolean().optional().describe("Background layers: tile the sprite vertically"),
+  xscale: z.number().optional().describe("Asset layers: horizontal scale of the placed graphic (default 1.0)"),
+  yscale: z.number().optional().describe("Asset layers: vertical scale of the placed graphic (default 1.0)"),
+  hspeed: z.number().optional().describe("Background layers: horizontal scroll speed (default 0.0)"),
+  vspeed: z.number().optional().describe("Background layers: vertical scroll speed (default 0.0)"),
+  x: z.number().optional().describe("Background layers: layer X offset in pixels (default 0)"),
+  y: z.number().optional().describe("Background layers: layer Y offset in pixels (default 0)"),
+}).refine(v => v.layerType !== "tile" || v.tilesetName !== undefined, {
+  message: "layerType \"tile\" requires tilesetName -- create one with add_tileset first",
+  path: ["tilesetName"],
+});
+
+const RemoveRoomLayerSchema = ProjectSchema.extend({
+  roomName: z.string().describe("Name of the existing room to remove the layer from"),
+  layerName: z.string().describe("Name of the layer to remove"),
+  force: z.boolean().default(false).describe("Delete even if the layer still holds elements or sub-layers (default false refuses)"),
+});
+
+const SetRoomLayerSchema = ProjectSchema.extend({
+  roomName: z.string().describe("Name of the existing room holding the layer"),
+  layerName: z.string().describe("Name of the layer to change (layers cannot be renamed -- GameMaker resolves them by name at runtime)"),
+  visible: z.boolean().optional().describe("New visibility"),
+  depth: z.number().int().optional().describe("New depth; higher draws further back"),
+});
+
+const GetRoomTilesSchema = ProjectSchema.extend({
+  roomName: z.string().describe("Name of the existing room holding the tile layer"),
+  layerName: z.string().describe("Name of the tile layer to read"),
+  x: z.number().int().nonnegative().optional().describe("First column to read (default 0)"),
+  y: z.number().int().nonnegative().optional().describe("First row to read (default 0)"),
+  width: z.number().int().positive().optional().describe("Number of columns to read (default: to the layer's right edge)"),
+  height: z.number().int().positive().optional().describe("Number of rows to read (default: to the layer's bottom edge)"),
+});
+
+const SetRoomTilesSchema = ProjectSchema.extend({
+  roomName: z.string().describe("Name of the existing room holding the tile layer"),
+  layerName: z.string().describe("Name of the tile layer to write"),
+  tiles: z
+    .array(
+      z.object({
+        x: z.number().int().nonnegative().describe("Column of the cell (0-based)"),
+        y: z.number().int().nonnegative().describe("Row of the cell (0-based)"),
+        index: z.number().int().min(-1).describe("Tile index to store; -1 clears the cell"),
+      })
+    )
+    .describe("Cells to write; each cell is validated before anything is written"),
+});
+
+const FillRoomTilesSchema = ProjectSchema.extend({
+  roomName: z.string().describe("Name of the existing room holding the tile layer"),
+  layerName: z.string().describe("Name of the tile layer to write"),
+  x: z.number().int().nonnegative().describe("Left column of the rectangle (0-based)"),
+  y: z.number().int().nonnegative().describe("Top row of the rectangle (0-based)"),
+  width: z.number().int().positive().describe("Rectangle width in cells; must stay inside the layer"),
+  height: z.number().int().positive().describe("Rectangle height in cells; must stay inside the layer"),
+  index: z.number().int().min(-1).describe("Tile index to fill with; -1 clears the rectangle"),
+});
+
 // Create MCP server instance
 const server = new Server(
   {
@@ -342,6 +468,7 @@ const TOOL_DEFS: ToolDef[] = [
   { name: "edit_script", description: "Edit an existing script's GML code, either replacing it entirely or appending to it", schema: EditScriptSchema },
   { name: "add_object", description: "Create a GameMaker object .yy file with optional event stubs and register it in the project", schema: AddObjectSchema },
   { name: "add_object_event", description: "Add a new event to an existing object, with its own GML code", schema: AddObjectEventSchema },
+  { name: "edit_object", description: "Edit an existing object in place: sprite, sprite mask, parent, solid/visible/persistent, physics settings, and object variable definitions -- omitted fields are left alone, null clears a reference", schema: EditObjectSchema },
   { name: "add_sprite_from_images", description: "Import frames from a directory into a new sprite and register it in the project", schema: AddSpriteSchema },
   { name: "add_room", description: "Create a GameMaker room with default instance and background layers, register it in the project and room order", schema: AddRoomSchema },
   { name: "edit_room", description: "Edit an existing room's width, height, and/or persistent flag", schema: EditRoomSchema },
@@ -353,6 +480,13 @@ const TOOL_DEFS: ToolDef[] = [
   { name: "get_object_info", description: "Get detailed info about an existing object: sprite, parent, physics, and its full event list with human-readable event names", schema: GetObjectInfoSchema },
   { name: "get_room_info", description: "Get detailed info about an existing room: dimensions, persistence, layers, and every placed instance with its position", schema: GetRoomInfoSchema },
   { name: "find_tile_region", description: "Check whether a world point in a room sits on a real tile, decoding GameMaker's compressed tile layer data (invisible to get_room_info's instance list). If occupied, reports the connected region of tiles it belongs to -- use this to confirm a spot is actually inside tile-drawn geometry (a building, a floor) before placing something there, not just clear of instances.", schema: FindTileRegionSchema },
+  { name: "list_room_layers", description: "List every layer in a room in layer-editor order, recursing into folder layers: name, type, depth, visibility, and element count", schema: ListRoomLayersSchema },
+  { name: "add_room_layer", description: "Add a layer of any kind (instance, asset, tile, path, background, effect, folder) to an existing room, including nested under a folder. A tile layer is created room-sized and all-empty, gridded by its tile set.", schema: AddRoomLayerSchema },
+  { name: "remove_room_layer", description: "Remove a layer from a room. Refuses a layer that still holds instances/tiles or sub-layers unless force=true", schema: RemoveRoomLayerSchema },
+  { name: "set_room_layer", description: "Change an existing layer's visibility and/or depth (layers cannot be renamed)", schema: SetRoomLayerSchema },
+  { name: "get_room_tiles", description: "Read a tile layer's cells as a row-major grid of tile indices, -1 meaning empty (translated from GameMaker's int32 empty sentinel). Omitted rect reads the whole layer.", schema: GetRoomTilesSchema },
+  { name: "set_room_tiles", description: "Write individual tile cells (index -1 clears a cell). Every cell is validated before anything is written; a call that changes nothing leaves the file untouched.", schema: SetRoomTilesSchema },
+  { name: "fill_room_tiles", description: "Fill an axis-aligned rectangle of a tile layer with one tile index, inclusive of its origin cell. Rectangles that run past the layer are errors, not silent clips.", schema: FillRoomTilesSchema },
   { name: "get_sprite_info", description: "Get detailed info about an existing sprite: real dimensions, frame count, origin, collision settings", schema: GetSpriteInfoSchema },
   { name: "edit_sprite", description: "Edit an existing sprite's origin, collision kind, and/or bounding box -- not its frame data", schema: EditSpriteSchema },
   { name: "get_script_info", description: "Get an existing script's current GML code", schema: GetScriptInfoSchema },
@@ -502,6 +636,15 @@ async function dispatchTool(name: string, args: unknown) {
         };
       }
 
+      case "edit_object": {
+        const { projectDir, objectName, spriteName, spriteMaskName, parentObjectName, solid, visible, persistent, physics, variableDefinitions } =
+          EditObjectSchema.parse(args);
+        const text = await editObject(projectDir, objectName, {
+          spriteName, spriteMaskName, parentObjectName, solid, visible, persistent, physics, variableDefinitions,
+        });
+        return { content: [{ type: "text", text }] };
+      }
+
       case "add_sprite_from_images": {
         const { projectDir, spriteName, framesDir } = AddSpriteSchema.parse(args);
         let yyp = await loadYyp(projectDir);
@@ -609,6 +752,55 @@ async function dispatchTool(name: string, args: unknown) {
         const layers = await getRoomTileLayers(projectDir, roomName);
         const results = findTileRegion(layers, x, y);
         return { content: [{ type: "text", text: JSON.stringify(results, null, 2) }] };
+      }
+
+      case "list_room_layers": {
+        const { projectDir, roomName } = ListRoomLayersSchema.parse(args);
+        const layers = await listRoomLayers(projectDir, roomName);
+        return { content: [{ type: "text", text: JSON.stringify(layers, null, 2) }] };
+      }
+
+      case "add_room_layer": {
+        const {
+          projectDir, roomName, layerName, layerType, depth, visible, parentLayerName,
+          tilesetName, spriteName, color, tiled, stretch, horizontalTile, verticalTile,
+          xscale, yscale, hspeed, vspeed, x, y,
+        } = AddRoomLayerSchema.parse(args);
+        const result = await addRoomLayer(projectDir, roomName, layerName, {
+          layerType, depth, visible, parentLayerName, tilesetName, spriteName, color,
+          tiled, stretch, horizontalTile, verticalTile, xscale, yscale, hspeed, vspeed, x, y,
+        });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "remove_room_layer": {
+        const { projectDir, roomName, layerName, force } = RemoveRoomLayerSchema.parse(args);
+        const result = await removeRoomLayer(projectDir, roomName, layerName, { force });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "set_room_layer": {
+        const { projectDir, roomName, layerName, visible, depth } = SetRoomLayerSchema.parse(args);
+        const text = await setRoomLayer(projectDir, roomName, layerName, { visible, depth });
+        return { content: [{ type: "text", text }] };
+      }
+
+      case "get_room_tiles": {
+        const { projectDir, roomName, layerName, x, y, width, height } = GetRoomTilesSchema.parse(args);
+        const result = await getRoomTiles(projectDir, roomName, layerName, { x, y, width, height });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "set_room_tiles": {
+        const { projectDir, roomName, layerName, tiles } = SetRoomTilesSchema.parse(args);
+        const result = await setRoomTiles(projectDir, roomName, layerName, tiles);
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
+      }
+
+      case "fill_room_tiles": {
+        const { projectDir, roomName, layerName, x, y, width, height, index } = FillRoomTilesSchema.parse(args);
+        const result = await fillRoomTiles(projectDir, roomName, layerName, { x, y, width, height, index });
+        return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
       }
 
       case "get_sprite_info": {
@@ -854,8 +1046,35 @@ async function main() {
   console.error("GameMaker MCP server running on stdio");
 }
 
-main().catch((error) => {
-  console.error("Fatal error in main():", error);
-  process.exit(1);
-});
+// Only open the stdio transport when this file is what node was launched with.
+// Importing it (the test suite asserts the schemas reject what the tools reject)
+// must not connect a transport and hijack stdin.
+function isEntryPoint(): boolean {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  // Windows paths are case-insensitive; a case-differing argv names the same file.
+  const same = (a: string, b: string) =>
+    (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+  try {
+    const entryPath = path.resolve(entry);
+    const selfPath = fileURLToPath(import.meta.url);
+    if (same(entryPath, selfPath)) return true;
+    // A directory junction or symlink anywhere in the install path makes the two
+    // differ textually while naming the same file. Compare real targets before
+    // giving up: a false negative here exits 0 with no output, and the client
+    // sees a silent death.
+    return same(realpathSync.native(entryPath), realpathSync.native(selfPath));
+  } catch {
+    return false;
+  }
+}
+
+export { TOOL_DEFS, ObjectPhysicsSchema, EditObjectSchema, AddRoomLayerSchema, dispatchTool };
+
+if (isEntryPoint()) {
+  main().catch((error) => {
+    console.error("Fatal error in main():", error);
+    process.exit(1);
+  });
+}
 

@@ -1,7 +1,8 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
-import { ensureFolder, validateResourceName, parseGameMakerJson, assertSafeResourceName, RESOURCE_VERSIONS, registerResource } from "./yyp.js";
+import { ensureFolder, validateResourceName, RESOURCE_VERSIONS, registerResource } from "./yyp.js";
+import { readRoomYy, writeRoomYy, ROOM_LAYER_GRID } from "./room_layers.js";
 
 export interface RoomOptions {
   width: number;
@@ -68,8 +69,8 @@ export async function addRoom(
         depth: 0,
         effectEnabled: true,
         effectType: null,
-        gridX: 16,
-        gridY: 16,
+        gridX: ROOM_LAYER_GRID,
+        gridY: ROOM_LAYER_GRID,
         hierarchyFrozen: false,
         inheritLayerDepth: false,
         inheritLayerSettings: false,
@@ -93,8 +94,8 @@ export async function addRoom(
         depth: 100,
         effectEnabled: true,
         effectType: null,
-        gridX: 16,
-        gridY: 16,
+        gridX: ROOM_LAYER_GRID,
+        gridY: ROOM_LAYER_GRID,
         hierarchyFrozen: false,
         hspeed: 0.0,
         htiled: false,
@@ -150,11 +151,7 @@ export async function addRoom(
     volume: 1.0
   };
 
-  await fs.writeFile(
-    path.join(dir, `${roomName}.yy`),
-    JSON.stringify(roomYy, null, 2),
-    "utf8"
-  );
+  await writeRoomYy(path.join(dir, `${roomName}.yy`), roomYy);
 
   ensureFolder(yyp, "Rooms");
 
@@ -189,17 +186,7 @@ export async function editRoom(
   roomName: string,
   options: RoomEditOptions
 ): Promise<void> {
-  assertSafeResourceName(roomName);
-  const roomYyPath = path.join(projectDir, "rooms", roomName, `${roomName}.yy`);
-  let room: any;
-  try {
-    room = parseGameMakerJson(await fs.readFile(roomYyPath, "utf8"));
-  } catch (e: any) {
-    if (e.code === "ENOENT") {
-      throw new Error(`Room "${roomName}" does not exist (expected ${roomYyPath})`);
-    }
-    throw new Error(`Failed to read room "${roomName}" at ${roomYyPath}: ${e.message}`);
-  }
+  const { room, file } = await readRoomYy(projectDir, roomName);
 
   if (options.width !== undefined) {
     room.roomSettings.Width = options.width;
@@ -219,7 +206,7 @@ export async function editRoom(
     room.roomSettings.persistent = options.persistent;
   }
 
-  await fs.writeFile(roomYyPath, JSON.stringify(room, null, 2), "utf8");
+  await writeRoomYy(file, room);
 }
 
 function getRoomOrderNodes(yyp: Yyp): any[] {

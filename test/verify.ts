@@ -27,6 +27,12 @@ import { lintProject } from "../src/gm/lint.js";
 import { addNote } from "../src/gm/notes.js";
 import { compileProject } from "../src/gm/build.js";
 import { findProjectTool, findIgor } from "../src/gm/gamemaker-tools.js";
+import { editObject } from "../src/gm/objects.js";
+import { listRoomLayers, addRoomLayer, removeRoomLayer, setRoomLayer } from "../src/gm/room_layers.js";
+import { encodeTileData, MAX_TILE_RUN, getRoomTiles, setRoomTiles, fillRoomTiles } from "../src/gm/room_tiles.js";
+// src/index.ts is import-safe: it only opens the stdio transport when it is the
+// process entry point, so the suite can assert on the real registry and schemas.
+import { TOOL_DEFS, EditObjectSchema } from "../src/index.js";
 
 let passed = 0;
 let failed = 0;
@@ -166,6 +172,46 @@ const REF = {
     "resourceType", "resourceVersion"]),
   animCurveChannel: new Set(["$GMAnimCurveChannel", "%Name", "name", "colour", "points",
     "resourceType", "resourceVersion", "visible"]),
+  // Captured from a real IDE-authored object: 261103GJ/objects/obj_transit_trigger
+  // /obj_transit_trigger.yy:31-40 -- every variable definition entry has exactly
+  // these keys, and varType is 0 (real) or 4 (asset).
+  objectProperty: new Set(["$GMObjectProperty", "%Name", "filters", "listItems", "multiselect",
+    "name", "rangeEnabled", "rangeMax", "rangeMin", "resourceType", "resourceVersion",
+    "value", "varType"]),
+  // Captured from 261103GJ/rooms/rm_lv1/rm_lv1.yy, layer "world_reality_tiles".
+  roomTileLayer: new Set(["$GMRTileLayer", "%Name", "depth", "effectEnabled", "effectType",
+    "gridX", "gridY", "hierarchyFrozen", "inheritLayerDepth", "inheritLayerSettings",
+    "inheritSubLayers", "inheritVisibility", "layers", "name", "properties", "resourceType",
+    "resourceVersion", "tiles", "tilesetId", "userdefinedDepth", "visible", "x", "y"]),
+  // Captured from 261103GJ/rooms/rm_lv1/rm_lv1.yy, layer "Background".
+  roomBackgroundLayer: new Set(["$GMRBackgroundLayer", "%Name", "animationFPS",
+    "animationSpeedType", "colour", "depth", "effectEnabled", "effectType", "gridX", "gridY",
+    "hierarchyFrozen", "hspeed", "htiled", "inheritLayerDepth", "inheritLayerSettings",
+    "inheritSubLayers", "inheritVisibility", "layers", "name", "properties", "resourceType",
+    "resourceVersion", "spriteId", "stretch", "userdefinedAnimFPS", "userdefinedDepth",
+    "visible", "vspeed", "vtiled", "x", "y"]),
+  // shape from GameMaker's writer; no 2026-era sample on this machine
+  roomAssetLayer: new Set(["$GMRAssetLayer", "%Name", "assets", "depth", "effectEnabled",
+    "effectType", "gridX", "gridY", "hierarchyFrozen", "inheritLayerDepth",
+    "inheritLayerSettings", "inheritSubLayers", "inheritVisibility", "layers", "name",
+    "properties", "resourceType", "resourceVersion", "userdefinedDepth", "visible"]),
+  // shape from GameMaker's writer; no 2026-era sample on this machine
+  roomPathLayer: new Set(["$GMRPathLayer", "%Name", "colour", "depth", "effectEnabled",
+    "effectType", "gridX", "gridY", "hierarchyFrozen", "inheritLayerDepth",
+    "inheritLayerSettings", "inheritSubLayers", "inheritVisibility", "layers", "name",
+    "pathId", "properties", "resourceType", "resourceVersion", "userdefinedDepth", "visible"]),
+  // shape from GameMaker's writer; no 2026-era sample on this machine
+  roomEffectLayer: new Set(["$GMREffectLayer", "%Name", "depth", "effectEnabled", "effectType",
+    "gridX", "gridY", "hierarchyFrozen", "inheritLayerDepth", "inheritLayerSettings",
+    "inheritSubLayers", "inheritVisibility", "layers", "name", "properties", "resourceType",
+    "resourceVersion", "userdefinedDepth", "visible"]),
+  // shape from GameMaker's writer; no 2026-era sample on this machine. The
+  // class name is $GMRLayer -- ProjectTool 2024.14.165 rejects $GMRFolder as
+  // "not in the target GameMaker release" and accepts this one.
+  roomFolder: new Set(["$GMRLayer", "%Name", "depth", "effectEnabled", "effectType", "gridX",
+    "gridY", "hierarchyFrozen", "inheritLayerDepth", "inheritLayerSettings", "inheritSubLayers",
+    "inheritVisibility", "layers", "name", "properties", "resourceType", "resourceVersion",
+    "userdefinedDepth", "visible"]),
 };
 
 function keysMatchRef(obj: object, ref: Set<string>): boolean {
@@ -173,6 +219,19 @@ function keysMatchRef(obj: object, ref: Set<string>): boolean {
   if (keys.size !== ref.size) return false;
   for (const k of keys) if (!ref.has(k)) return false;
   return true;
+}
+
+// GameMaker writes .yy keys in case-insensitive alphabetical order. Matching
+// it means a tool-written file and an IDE resave of it produce no diff.
+function keysSorted(obj: object): boolean {
+  const keys = Object.keys(obj);
+  const sorted = [...keys].sort((a, b) => {
+    const al = a.toLowerCase();
+    const bl = b.toLowerCase();
+    if (al !== bl) return al < bl ? -1 : 1;
+    return a < b ? -1 : a > b ? 1 : 0;
+  });
+  return keys.every((k, i) => k === sorted[i]);
 }
 
 async function makeBareProject(): Promise<string> {
@@ -1233,6 +1292,692 @@ async function main() {
     noTilesetRegion.occupied === true && noTilesetRegion.tileCount === 4);
 
   await expectThrows("getRoomTileLayers: rejects a nonexistent room", () => getRoomTileLayers(dir, "rmDoesNotExist"));
+
+  // --- edit_object (contract 1): sprite/mask/parent, flags, physics, variable
+  // definitions. Undefined leaves a field alone, null clears a reference. ---
+  const editObjPath = path.join(dir, "objects/objTest/objTest.yy");
+  await editObject(dir, "objTest", {
+    spriteName: "sprTest",
+    spriteMaskName: "sprTest",
+    parentObjectName: "objOtherRenamed",
+    solid: true,
+    visible: false,
+    persistent: true,
+  });
+  const editedObject = JSON.parse(await fs.readFile(editObjPath, "utf8"));
+  ok("edit_object: top-level keys still match real GameMaker schema", keysMatchRef(editedObject, REF.object));
+  ok("edit_object: sprite resolved to a real {name,path} reference",
+    editedObject.spriteId?.name === "sprTest" && editedObject.spriteId?.path === "sprites/sprTest/sprTest.yy",
+    JSON.stringify(editedObject.spriteId));
+  ok("edit_object: sprite mask resolved to a real {name,path} reference",
+    editedObject.spriteMaskId?.name === "sprTest" && editedObject.spriteMaskId?.path === "sprites/sprTest/sprTest.yy");
+  ok("edit_object: parent object resolved to a real {name,path} reference",
+    editedObject.parentObjectId?.name === "objOtherRenamed"
+    && editedObject.parentObjectId?.path === "objects/objOtherRenamed/objOtherRenamed.yy");
+  ok("edit_object: solid/visible/persistent applied",
+    editedObject.solid === true && editedObject.visible === false && editedObject.persistent === true);
+
+  await editObject(dir, "objTest", {
+    physics: {
+      enabled: true, density: 0.7, friction: 0.3, restitution: 0.2, collisionGroup: 3,
+      kinematic: true, sensor: true, shape: 2, startAwake: false, angularDamping: 0.4, linearDamping: 0.5,
+    },
+  });
+  const physicsObj = JSON.parse(await fs.readFile(editObjPath, "utf8"));
+  ok("edit_object: physics writes GameMaker's real physics* keys (friendly names never reach the .yy)",
+    physicsObj.physicsObject === true && physicsObj.physicsDensity === 0.7
+    && physicsObj.physicsFriction === 0.3 && physicsObj.physicsRestitution === 0.2
+    && physicsObj.physicsGroup === 3 && physicsObj.physicsKinematic === true
+    && physicsObj.physicsSensor === true && physicsObj.physicsShape === 2
+    && physicsObj.physicsStartAwake === false && physicsObj.physicsAngularDamping === 0.4
+    && physicsObj.physicsLinearDamping === 0.5);
+  ok("edit_object: physics leaves the object's key set unchanged", keysMatchRef(physicsObj, REF.object));
+
+  await expectThrows("edit_object: physics.gravityScale is rejected (a GMObject .yy has no gravity-scale key)",
+    () => editObject(dir, "objTest", { physics: { gravityScale: 1 } }));
+
+  await editObject(dir, "objTest", { physics: { enabled: false } });
+  const physicsOff = JSON.parse(await fs.readFile(editObjPath, "utf8"));
+  ok("edit_object: physics enabled=false restores GameMaker's default physics block",
+    physicsOff.physicsObject === false && physicsOff.physicsDensity === 0.5
+    && physicsOff.physicsShape === 1 && physicsOff.physicsGroup === 1
+    && physicsOff.physicsStartAwake === true && physicsOff.physicsKinematic === false
+    && JSON.stringify(physicsOff.physicsShapePoints) === "[]");
+
+  await editObject(dir, "objTest", {
+    variableDefinitions: [
+      { name: "target_room", value: "rm_lv2", type: "asset" },
+      { name: "target_x", value: "-1" },
+    ],
+  });
+  const varDefObj = JSON.parse(await fs.readFile(editObjPath, "utf8"));
+  ok("edit_object: variable definition entry keys match real GameMaker schema",
+    varDefObj.properties.length === 2 && keysMatchRef(varDefObj.properties[0], REF.objectProperty),
+    JSON.stringify(varDefObj.properties[0]));
+  ok("edit_object: variable definition type maps to GameMaker's varType (asset=4, default real=0)",
+    varDefObj.properties[0].varType === 4 && varDefObj.properties[1].varType === 0
+    && varDefObj.properties[1].type === undefined);
+  ok("edit_object: variable definition name/value applied",
+    varDefObj.properties[0].name === "target_room" && varDefObj.properties[0].value === "rm_lv2"
+    && varDefObj.properties[0]["%Name"] === "target_room");
+
+  await editObject(dir, "objTest", {
+    spriteName: null, spriteMaskName: null, parentObjectName: null,
+    solid: false, visible: true, variableDefinitions: null,
+  });
+  const clearedObj = JSON.parse(await fs.readFile(editObjPath, "utf8"));
+  ok("edit_object: null clears sprite, mask and parent",
+    clearedObj.spriteId === null && clearedObj.spriteMaskId === null && clearedObj.parentObjectId === null);
+  ok("edit_object: null variableDefinitions empties properties (never a null list)",
+    Array.isArray(clearedObj.properties) && clearedObj.properties.length === 0);
+  ok("edit_object: flags cleared", clearedObj.solid === false && clearedObj.visible === true);
+
+  // A call where nothing differs must not rewrite the file at all: re-encoding
+  // an untouched .yy (key order, float spelling) is not guaranteed to be
+  // byte-identical, so a needless write is churn the IDE then has to reread.
+  const editObjBytesBefore = await fs.readFile(editObjPath);
+  const noOpText = await editObject(dir, "objTest", {
+    spriteName: null, spriteMaskName: null, parentObjectName: null,
+    solid: false, visible: true, persistent: true,
+    physics: { enabled: false },
+    variableDefinitions: [],
+  });
+  const editObjBytesAfter = await fs.readFile(editObjPath);
+  ok("edit_object: a call that changes nothing leaves the file byte-identical",
+    editObjBytesBefore.equals(editObjBytesAfter), noOpText);
+
+  await expectThrows("edit_object: empty options throw rather than silently doing nothing",
+    () => editObject(dir, "objTest", {}));
+  try {
+    await editObject(dir, "objTest", { spriteName: "sprDoesNotExist" });
+    ok("edit_object: missing sprite error names the expected path", false, "expected an error");
+  } catch (e: any) {
+    ok("edit_object: missing sprite error names the expected path",
+      e.message.includes(path.join(dir, "sprites", "sprDoesNotExist", "sprDoesNotExist.yy")), e.message);
+  }
+  await expectThrows("edit_object: a duplicate variable definition is rejected",
+    () => editObject(dir, "objTest", {
+      variableDefinitions: [{ name: "dup", value: "1" }, { name: "dup", value: "2" }],
+    }));
+
+  // --- add_room_layer (contract 3): every layer kind, defaults, nesting ---
+  // rmLayers is 200x200; tsTileLayerTest is an 8x8 tileset, so its tile layer
+  // is a 25x25 grid.
+  yyp = await loadYyp(dir);
+  yyp = await addRoom(dir, yyp, "rmLayers", { width: 200, height: 200, persistent: false });
+  await writeYyp(dir, yyp);
+  const layersRoomPath = path.join(dir, "rooms/rmLayers/rmLayers.yy");
+  const readLayersRoom = async () => JSON.parse(await fs.readFile(layersRoomPath, "utf8"));
+
+  // addRoom scaffolds Instances (depth 0) + Background (depth 100), so the
+  // first defaulted layer lands at 200 and each later one 100 behind that.
+  const addedEffect = await addRoomLayer(dir, "rmLayers", "L_Effect", { layerType: "effect" });
+  ok("add_room_layer: default depth is 100 behind the room's deepest layer (max 100 -> 200)",
+    addedEffect.depth === 200, JSON.stringify(addedEffect));
+  ok("add_room_layer: returns roomName/layerName/layerType/depth/elementCount",
+    addedEffect.roomName === "rmLayers" && addedEffect.layerName === "L_Effect"
+    && addedEffect.layerType === "GMREffectLayer" && addedEffect.elementCount === 0);
+
+  const addedInstance = await addRoomLayer(dir, "rmLayers", "L_Instance", { layerType: "instance" });
+  const addedAsset = await addRoomLayer(dir, "rmLayers", "L_Asset", { layerType: "asset", spriteName: "sprTest" });
+  const addedTile = await addRoomLayer(dir, "rmLayers", "L_Tile", { layerType: "tile", tilesetName: "tsTileLayerTest" });
+  const addedPath = await addRoomLayer(dir, "rmLayers", "L_Path", { layerType: "path" });
+  const addedBackground = await addRoomLayer(dir, "rmLayers", "L_Background", { layerType: "background" });
+  const addedFolder = await addRoomLayer(dir, "rmLayers", "L_Folder", { layerType: "folder" });
+  ok("add_room_layer: successive defaulted depths are 300/400/500/600/700/800",
+    addedInstance.depth === 300 && addedAsset.depth === 400 && addedTile.depth === 500
+    && addedPath.depth === 600 && addedBackground.depth === 700 && addedFolder.depth === 800,
+    [addedInstance, addedAsset, addedTile, addedPath, addedBackground, addedFolder].map(l => l.depth).join(","));
+
+  const childLayer = await addRoomLayer(dir, "rmLayers", "L_FolderChild", {
+    layerType: "instance",
+    parentLayerName: "L_Folder",
+  });
+  const layersRoom = await readLayersRoom();
+  const byName = (n: string) => layersRoom.layers.find((l: any) => l.name === n);
+
+  ok("add_room_layer: every layer kind's key set matches GameMaker's",
+    keysMatchRef(byName("L_Instance"), REF.roomInstanceLayer)
+    && keysMatchRef(byName("L_Tile"), REF.roomTileLayer)
+    && keysMatchRef(byName("L_Background"), REF.roomBackgroundLayer)
+    && keysMatchRef(byName("L_Asset"), REF.roomAssetLayer)
+    && keysMatchRef(byName("L_Path"), REF.roomPathLayer)
+    && keysMatchRef(byName("L_Effect"), REF.roomEffectLayer)
+    && keysMatchRef(byName("L_Folder"), REF.roomFolder),
+    ["L_Instance", "L_Tile", "L_Background", "L_Asset", "L_Path", "L_Effect", "L_Folder"]
+      .filter(n => !keysMatchRef(byName(n), (REF as any)[({
+        L_Instance: "roomInstanceLayer", L_Tile: "roomTileLayer", L_Background: "roomBackgroundLayer",
+        L_Asset: "roomAssetLayer", L_Path: "roomPathLayer", L_Effect: "roomEffectLayer", L_Folder: "roomFolder",
+      } as any)[n]])).join(","));
+  ok("add_room_layer: every layer kind's keys are in GameMaker's alphabetical order",
+    ["L_Instance", "L_Tile", "L_Background", "L_Asset", "L_Path", "L_Effect", "L_Folder"]
+      .every(n => keysSorted(byName(n))),
+    ["L_Instance", "L_Tile", "L_Background", "L_Asset", "L_Path", "L_Effect", "L_Folder"]
+      .filter(n => !keysSorted(byName(n))).join(","));
+  ok("add_room_layer: layerName is mirrored into name and %Name",
+    byName("L_Folder").name === "L_Folder" && byName("L_Folder")["%Name"] === "L_Folder");
+
+  // Tile layers are a grid the size of the ROOM at the TILESET's pitch -- the
+  // layer's own gridX/gridY stays at the editor snap grid, not the tile size.
+  const tileLayerYy = byName("L_Tile");
+  ok("add_room_layer: tile layer cursor is sized by the tileset (200px room / 8px tiles = 25x25)",
+    tileLayerYy.tiles.SerialiseWidth === 25 && tileLayerYy.tiles.SerialiseHeight === 25,
+    `${tileLayerYy.tiles.SerialiseWidth}x${tileLayerYy.tiles.SerialiseHeight}`);
+  const freshTileBuffer = decompressTileData(tileLayerYy.tiles.TileCompressedData);
+  ok("add_room_layer: a fresh tile layer is all-empty and references the tileset",
+    freshTileBuffer.length === 625 && freshTileBuffer.every(v => v === EMPTY_TILE)
+    && tileLayerYy.tilesetId?.name === "tsTileLayerTest"
+    && tileLayerYy.tilesetId?.path === "tilesets/tsTileLayerTest/tsTileLayerTest.yy");
+  ok("add_room_layer: tile layer's own gridX/gridY stays the editor snap grid, not the tile size",
+    tileLayerYy.gridX === 32 && tileLayerYy.gridY === 32);
+  ok("add_room_layer: add_room's scaffold and new layers share one 32px snap grid",
+    layersRoom.layers.find((l: any) => l.name === "Instances").gridX === 32
+    && layersRoom.layers.find((l: any) => l.name === "Background").gridY === 32,
+    `scaffold=${layersRoom.layers.find((l: any) => l.name === "Instances").gridX}`);
+  ok("add_room_layer: the tile layer's nested tiles object keeps GameMaker's field order",
+    JSON.stringify(Object.keys(tileLayerYy.tiles))
+      === JSON.stringify(["SerialiseHeight", "SerialiseWidth", "TileCompressedData", "TileDataFormat"]),
+    Object.keys(tileLayerYy.tiles).join(","));
+
+  ok("add_room_layer: visible defaults to true",
+    byName("L_Instance").visible === true && byName("L_Folder").visible === true);
+  ok("add_room_layer: instance layer starts with no instances", byName("L_Instance").instances.length === 0);
+  ok("add_room_layer: folder layer starts with no sub-layers and the child is nested inside it",
+    byName("L_Folder").layers.length === 1 && byName("L_Folder").layers[0].name === "L_FolderChild"
+    && !byName("L_FolderChild"), "child should not also be a top-level layer");
+  ok("add_room_layer: nested child depth still defaults to max+100 (900)",
+    childLayer.depth === 900 && byName("L_Folder").layers[0].depth === 900, String(childLayer.depth));
+
+  const assetGraphic = byName("L_Asset").assets[0];
+  ok("add_room_layer: asset layer holds a sprite graphic bound to the real sprite",
+    byName("L_Asset").assets.length === 1 && assetGraphic.spriteId?.name === "sprTest"
+    && assetGraphic.spriteId?.path === "sprites/sprTest/sprTest.yy"
+    && assetGraphic.resourceType === "GMRSpriteGraphic" && assetGraphic.scaleX === 1);
+  ok("add_room_layer: background layer defaults to opaque black, untiled, unstretched",
+    byName("L_Background").colour === 4278190080 && byName("L_Background").htiled === false
+    && byName("L_Background").vtiled === false && byName("L_Background").spriteId === null);
+  ok("add_room_layer: path layer serialises an unselected path as null", byName("L_Path").pathId === null);
+
+  // Listing walks folders and reports the element counts removeRoomLayer uses.
+  const layerList = await listRoomLayers(dir, "rmLayers");
+  ok("list_room_layers: reports every layer including nested ones",
+    layerList.length === 10 && layerList.filter(l => l.name === "L_FolderChild").length === 1, `${layerList.length}`);
+  ok("list_room_layers: nested layers carry their folder name",
+    layerList.find(l => l.name === "L_FolderChild")?.parentLayerName === "L_Folder");
+  ok("list_room_layers: a fresh tile layer reports 0 elements, not 625 empty cells",
+    layerList.find(l => l.name === "L_Tile")?.elementCount === 0);
+  ok("list_room_layers: depth and type are reported",
+    layerList.find(l => l.name === "L_Tile")?.depth === 500
+    && layerList.find(l => l.name === "L_Tile")?.type === "GMRTileLayer");
+  await expectThrows("list_room_layers: rejects a nonexistent room", () => listRoomLayers(dir, "rmDoesNotExist"));
+
+  await expectThrows("add_room_layer: a duplicate layer name is rejected",
+    () => addRoomLayer(dir, "rmLayers", "L_Tile", { layerType: "folder" }));
+  await expectThrows("add_room_layer: a tile layer without tilesetName is rejected",
+    () => addRoomLayer(dir, "rmLayers", "L_TileNoTileset", { layerType: "tile" }));
+  await expectThrows("add_room_layer: an unknown parent layer is rejected",
+    () => addRoomLayer(dir, "rmLayers", "L_Orphan", { layerType: "instance", parentLayerName: "L_NoSuchFolder" }));
+  await expectThrows("add_room_layer: a non-folder parent is rejected",
+    () => addRoomLayer(dir, "rmLayers", "L_Orphan2", { layerType: "instance", parentLayerName: "L_Instance" }));
+
+  // Layer names are free text in GameMaker's room editor, not GML identifiers.
+  await addRoomLayer(dir, "rmLayers", "World Reality", { layerType: "folder" });
+  await addRoomLayer(dir, "rmLayers", "BG - sky", { layerType: "background", x: 12, y: -4 });
+  const namesRoom = await readLayersRoom();
+  ok("add_room_layer: free-text layer names with spaces and hyphens are accepted",
+    namesRoom.layers.some((l: any) => l.name === "World Reality" && l["%Name"] === "World Reality")
+    && namesRoom.layers.some((l: any) => l.name === "BG - sky"));
+  const skyLayer = namesRoom.layers.find((l: any) => l.name === "BG - sky");
+  ok("add_room_layer: background x/y options are written to the layer", skyLayer.x === 12 && skyLayer.y === -4,
+    `x=${skyLayer.x} y=${skyLayer.y}`);
+  await expectThrows("add_room_layer: a layer name with a path separator is rejected",
+    () => addRoomLayer(dir, "rmLayers", "Tiles/Top", { layerType: "folder" }));
+  await expectThrows("add_room_layer: a layer name with a dot is rejected",
+    () => addRoomLayer(dir, "rmLayers", "v1.2 sky", { layerType: "folder" }));
+  await expectThrows("add_room_layer: a layer name with a colon is rejected",
+    () => addRoomLayer(dir, "rmLayers", "Layer:1", { layerType: "folder" }));
+  await expectThrows("add_room_layer: an empty layer name is rejected",
+    () => addRoomLayer(dir, "rmLayers", "", { layerType: "folder" }));
+  await expectThrows("add_room_layer: a layer name over 255 characters is rejected",
+    () => addRoomLayer(dir, "rmLayers", "x".repeat(256), { layerType: "folder" }));
+
+  // --- remove_room_layer: empty vs non-empty vs folder, and instanceCreationOrder ---
+  await addRoomLayer(dir, "rmLayers", "L_EmptyFolder", { layerType: "folder" });
+  const removedEmpty = await removeRoomLayer(dir, "rmLayers", "L_EmptyFolder");
+  ok("remove_room_layer: an empty layer is removed without force",
+    removedEmpty.removed === true && removedEmpty.layerName === "L_EmptyFolder"
+    && !(await readLayersRoom()).layers.some((l: any) => l.name === "L_EmptyFolder"));
+
+  // A folder reports everything nested inside it (what the layer editor's count
+  // column shows), while the nested layer is listed separately with its own count.
+  await addRoomLayer(dir, "rmLayers", "L_Group", { layerType: "folder" });
+  await addRoomLayer(dir, "rmLayers", "L_GroupTiles", { layerType: "tile", tilesetName: "tsTileLayerTest", parentLayerName: "L_Group" });
+  await fillRoomTiles(dir, "rmLayers", "L_GroupTiles", { x: 0, y: 0, width: 2, height: 3, index: 2 });
+  const grouped = await listRoomLayers(dir, "rmLayers");
+  ok("list_room_layers: a folder reports the recursive element count of everything inside it",
+    grouped.find(l => l.name === "L_Group")?.elementCount === 6
+    && grouped.find(l => l.name === "L_GroupTiles")?.elementCount === 6,
+    JSON.stringify(grouped.filter(l => l.name.startsWith("L_Group"))));
+  await removeRoomLayer(dir, "rmLayers", "L_Group", { force: true });
+
+  await fillRoomTiles(dir, "rmLayers", "L_Tile", { x: 0, y: 0, width: 2, height: 2, index: 3 });
+  try {
+    await removeRoomLayer(dir, "rmLayers", "L_Tile");
+    ok("remove_room_layer: a non-empty layer is refused without force", false, "expected an error");
+  } catch (e: any) {
+    ok("remove_room_layer: a non-empty layer is refused without force, stating the element count",
+      e.message.includes("4 element(s)"), e.message);
+  }
+  const removedTiles = await removeRoomLayer(dir, "rmLayers", "L_Tile", { force: true });
+  ok("remove_room_layer: force deletes a non-empty layer",
+    removedTiles.removed === true && !(await readLayersRoom()).layers.some((l: any) => l.name === "L_Tile"));
+
+  // A forced instance-layer removal deletes its instances, so their
+  // instanceCreationOrder entries must go too -- a room listing an instance it
+  // can't find is a .yy GameMaker refuses to open.
+  const keptInstance = await addRoomInstance(dir, "rmLayers", "objTest", 8, 8);
+  const doomedInstance = await addRoomInstance(dir, "rmLayers", "objTest", 24, 24);
+  const roomBeforePrune = await readLayersRoom();
+  const instanceLayerYy = roomBeforePrune.layers.find((l: any) => l.name === "L_Instance");
+  const doomedEntry = roomBeforePrune.layers
+    .find((l: any) => l.resourceType === "GMRInstanceLayer")
+    .instances.find((i: any) => i.name === doomedInstance.instanceName);
+  instanceLayerYy.instances.push(doomedEntry);
+  roomBeforePrune.layers
+    .find((l: any) => l.resourceType === "GMRInstanceLayer")
+    .instances.splice(roomBeforePrune.layers.find((l: any) => l.resourceType === "GMRInstanceLayer").instances.indexOf(doomedEntry), 1);
+  await fs.writeFile(layersRoomPath, JSON.stringify(roomBeforePrune, null, 2), "utf8");
+  ok("remove_room_layer: fixture instance sits in the layer about to be removed",
+    (await readLayersRoom()).layers.find((l: any) => l.name === "L_Instance").instances
+      .some((i: any) => i.name === doomedInstance.instanceName));
+
+  await expectThrows("remove_room_layer: a non-empty instance layer is refused without force",
+    () => removeRoomLayer(dir, "rmLayers", "L_Instance"));
+  await removeRoomLayer(dir, "rmLayers", "L_Instance", { force: true });
+  const roomAfterPrune = await readLayersRoom();
+  ok("remove_room_layer: forced instance-layer removal prunes its instanceCreationOrder entries",
+    !roomAfterPrune.instanceCreationOrder.some((e: any) => e.name === doomedInstance.instanceName),
+    JSON.stringify(roomAfterPrune.instanceCreationOrder.map((e: any) => e.name)));
+  ok("remove_room_layer: pruning leaves the instances that still exist alone",
+    roomAfterPrune.instanceCreationOrder.some((e: any) => e.name === keptInstance.instanceName)
+    && roomAfterPrune.layers.some((l: any) => (l.instances ?? []).some((i: any) => i.name === keptInstance.instanceName)));
+
+  try {
+    await removeRoomLayer(dir, "rmLayers", "L_Folder");
+    ok("remove_room_layer: a folder holding sub-layers is refused without force", false, "expected an error");
+  } catch (e: any) {
+    ok("remove_room_layer: a folder holding sub-layers is refused without force",
+      e.message.includes("1 sub-layer(s)"), e.message);
+  }
+  await removeRoomLayer(dir, "rmLayers", "L_Folder", { force: true });
+  ok("remove_room_layer: force deletes the folder and everything nested in it",
+    !(await readLayersRoom()).layers.some((l: any) => l.name === "L_Folder"));
+  await expectThrows("remove_room_layer: rejects a nonexistent layer",
+    () => removeRoomLayer(dir, "rmLayers", "L_NoSuchLayer"));
+
+  // An asset layer's contents are its `assets` array -- counting only instance
+  // and tile layers reported one as empty and deleted its sprite without force.
+  await addRoomLayer(dir, "rmLayers", "L_AssetFull", { layerType: "asset", spriteName: "sprTest" });
+  const assetWithSprite = await addRoomLayer(dir, "rmLayers", "L_AssetFull2", { layerType: "asset", spriteName: "sprTest" });
+  ok("add_room_layer: reports the element count it just created, not a hardcoded 0",
+    assetWithSprite.elementCount === 1, JSON.stringify(assetWithSprite));
+  ok("add_room_layer: a fresh tile layer reports 0 elements (empty cells are not elements)",
+    (await addRoomLayer(dir, "rmLayers", "L_TileEstimate", { layerType: "tile", tilesetName: "tsTileLayerTest" })).elementCount === 0);
+  ok("list_room_layers: an asset layer holding a sprite reports 1 element, not 0",
+    (await listRoomLayers(dir, "rmLayers")).find(l => l.name === "L_AssetFull")?.elementCount === 1);
+  try {
+    await removeRoomLayer(dir, "rmLayers", "L_AssetFull");
+    ok("remove_room_layer: a sprite-bearing asset layer is refused without force", false, "expected an error");
+  } catch (e: any) {
+    ok("remove_room_layer: a sprite-bearing asset layer is refused without force",
+      e.message.includes("1 element(s)"), e.message);
+  }
+  ok("remove_room_layer: force deletes the sprite-bearing asset layer",
+    (await removeRoomLayer(dir, "rmLayers", "L_AssetFull", { force: true })).removed === true
+    && !(await readLayersRoom()).layers.some((l: any) => l.name === "L_AssetFull"));
+
+  // A room must keep at least one layer -- an empty layers array is a room
+  // GameMaker refuses to open.
+  yyp = await loadYyp(dir);
+  yyp = await addRoom(dir, yyp, "rmLastLayer", { width: 100, height: 100, persistent: false });
+  await writeYyp(dir, yyp);
+  await removeRoomLayer(dir, "rmLastLayer", "Background");
+  ok("remove_room_layer: leaves a room with exactly one layer", (await listRoomLayers(dir, "rmLastLayer")).length === 1);
+  try {
+    await removeRoomLayer(dir, "rmLastLayer", "Instances");
+    ok("remove_room_layer: refuses to remove the room's last top-level layer", false, "expected an error");
+  } catch (e: any) {
+    ok("remove_room_layer: refuses to remove the room's last top-level layer",
+      e.message.includes("last layer") && e.message.includes("at least one layer"), e.message);
+  }
+  await expectThrows("remove_room_layer: the last-layer refusal cannot be forced through",
+    () => removeRoomLayer(dir, "rmLastLayer", "Instances", { force: true }));
+  ok("remove_room_layer: the refused last layer is still there",
+    (await listRoomLayers(dir, "rmLastLayer")).length === 1);
+
+  // --- set_room_layer: depth + visibility, explicitly no rename ---
+  await setRoomLayer(dir, "rmLayers", "L_Path", { depth: 42, visible: false });
+  const setPath = (await readLayersRoom()).layers.find((l: any) => l.name === "L_Path");
+  ok("set_room_layer: depth and visibility applied", setPath.depth === 42 && setPath.visible === false);
+  await setRoomLayer(dir, "rmLayers", "L_Path", { visible: true });
+  const reShownPath = (await readLayersRoom()).layers.find((l: any) => l.name === "L_Path");
+  ok("set_room_layer: visibility can be turned back on without touching depth",
+    reShownPath.visible === true && reShownPath.depth === 42);
+
+  // A call that changes nothing must not rewrite the file (the same rule every
+  // other writer here follows).
+  const setBytesBefore = await fs.readFile(layersRoomPath);
+  const setStatBefore = await fs.stat(layersRoomPath);
+  await new Promise(resolve => setTimeout(resolve, 15));
+  const unchangedMessage = await setRoomLayer(dir, "rmLayers", "L_Path", { depth: 42, visible: true });
+  const setStatAfter = await fs.stat(layersRoomPath);
+  ok("set_room_layer: a call that changes nothing reports it instead of claiming an update",
+    /unchanged/.test(unchangedMessage), unchangedMessage);
+  ok("set_room_layer: a call that changes nothing leaves the file byte-identical and unrewritten",
+    setBytesBefore.equals(await fs.readFile(layersRoomPath)) && setStatAfter.mtimeMs === setStatBefore.mtimeMs,
+    `mtime ${setStatBefore.mtimeMs} -> ${setStatAfter.mtimeMs}`);
+
+  // Nested layers are reached the same way as top-level ones.
+  await addRoomLayer(dir, "rmLayers", "S_Folder", { layerType: "folder" });
+  await addRoomLayer(dir, "rmLayers", "S_Child", { layerType: "instance", parentLayerName: "S_Folder" });
+  await setRoomLayer(dir, "rmLayers", "S_Child", { depth: 7, visible: false });
+  const nestedChild = (await readLayersRoom()).layers
+    .find((l: any) => l.name === "S_Folder").layers.find((l: any) => l.name === "S_Child");
+  ok("set_room_layer: works on a layer nested inside a folder", nestedChild.depth === 7 && nestedChild.visible === false);
+
+  await expectThrows("set_room_layer: an empty change is rejected",
+    () => setRoomLayer(dir, "rmLayers", "L_Path", {}));
+  await expectThrows("set_room_layer: rejects a nonexistent layer",
+    () => setRoomLayer(dir, "rmLayers", "L_NoSuchLayer", { depth: 1 }));
+
+  // --- get/set/fill_room_tiles (contracts 6-8) ---
+  // 200x200 room, 8x8 tileset -> 25x25 cells at an 8px pitch.
+  await addRoomLayer(dir, "rmLayers", "L_Tiles", { layerType: "tile", tilesetName: "tsTileLayerTest" });
+
+  const wholeLayer = await getRoomTiles(dir, "rmLayers", "L_Tiles");
+  ok("get_room_tiles: omitted rect reads the whole layer (25x25)",
+    wholeLayer.width === 25 && wholeLayer.height === 25 && wholeLayer.tiles.length === 25
+    && wholeLayer.tiles[0].length === 25);
+  ok("get_room_tiles: pitch comes from the tileset (8px), not the layer's 32px snap grid",
+    wholeLayer.gridX === 8 && wholeLayer.gridY === 8, `${wholeLayer.gridX}x${wholeLayer.gridY}`);
+  ok("get_room_tiles: an empty layer reads as all -1 (EMPTY_TILE translated at the API)",
+    wholeLayer.tiles.every(row => row.every(v => v === -1)));
+  ok("get_room_tiles: reports the tileset it is bound to", wholeLayer.tilesetName === "tsTileLayerTest");
+
+  const firstWrite = await setRoomTiles(dir, "rmLayers", "L_Tiles", [{ x: 0, y: 0, index: 5 }]);
+  ok("set_room_tiles: reports how many cells changed", firstWrite.updated === 1);
+  const afterFirstWrite = await getRoomTiles(dir, "rmLayers", "L_Tiles", { x: 0, y: 0, width: 2, height: 1 });
+  ok("set_room_tiles: the written cell reads back as the tile index, its neighbour stays -1",
+    afterFirstWrite.tiles[0][0] === 5 && afterFirstWrite.tiles[0][1] === -1);
+  const storedTiles = decompressTileData(
+    (await readLayersRoom()).layers.find((l: any) => l.name === "L_Tiles").tiles.TileCompressedData);
+  ok("set_room_tiles: on disk the empty cells are GameMaker's int32 sentinel, not -1",
+    storedTiles[0] === 5 && storedTiles[1] === EMPTY_TILE && storedTiles.length === 625);
+
+  const clearWrite = await setRoomTiles(dir, "rmLayers", "L_Tiles", [{ x: 0, y: 0, index: -1 }]);
+  ok("set_room_tiles: index -1 clears a cell", clearWrite.updated === 1
+    && (await getRoomTiles(dir, "rmLayers", "L_Tiles", { x: 0, y: 0, width: 1, height: 1 })).tiles[0][0] === -1);
+
+  try {
+    await setRoomTiles(dir, "rmLayers", "L_Tiles", [{ x: 25, y: 0, index: 1 }]);
+    ok("set_room_tiles: out-of-bounds cell error names the layer's bounds", false, "expected an error");
+  } catch (e: any) {
+    ok("set_room_tiles: out-of-bounds cell error names the layer's bounds",
+      e.message.includes("25x25") && e.message.includes("valid x 0-24, y 0-24"), e.message);
+  }
+  await expectThrows("set_room_tiles: a tile index below -1 is rejected",
+    () => setRoomTiles(dir, "rmLayers", "L_Tiles", [{ x: 0, y: 0, index: -2 }]));
+  try {
+    await setRoomTiles(dir, "rmLayers", "L_Tiles", [{ x: 0, y: 0, index: 2147483648 }]);
+    ok("set_room_tiles: an index past the int32 slot is rejected, naming the valid range", false, "expected an error");
+  } catch (e: any) {
+    ok("set_room_tiles: an index past the int32 slot is rejected, naming the valid range",
+      e.message.includes("2147483646") && e.message.includes("-1 (empty)"), e.message);
+  }
+  await expectThrows("set_room_tiles: 2147483647 (the int32 apex) is rejected rather than wrapping",
+    () => setRoomTiles(dir, "rmLayers", "L_Tiles", [{ x: 0, y: 0, index: 2147483647 }]));
+
+  // The referenced tileset is the honest upper bound for a tile index.
+  const tileSetYy = JSON.parse(await fs.readFile(path.join(dir, "tilesets/tsTileLayerTest/tsTileLayerTest.yy"), "utf8"));
+  const tilesInSet: number = tileSetYy.tile_count;
+  try {
+    await setRoomTiles(dir, "rmLayers", "L_Tiles", [{ x: 0, y: 0, index: tilesInSet }]);
+    ok("set_room_tiles: an index past the tileset's tile count is rejected, naming the tileset", false, "expected an error");
+  } catch (e: any) {
+    ok("set_room_tiles: an index past the tileset's tile count is rejected, naming the tileset",
+      e.message.includes("tsTileLayerTest") && e.message.includes(`${tilesInSet} tiles`), e.message);
+  }
+  try {
+    await fillRoomTiles(dir, "rmLayers", "L_Tiles", { x: 0, y: 0, width: 1, height: 1, index: tilesInSet });
+    ok("fill_room_tiles: the same tileset bound applies to a fill", false, "expected an error");
+  } catch (e: any) {
+    ok("fill_room_tiles: the same tileset bound applies to a fill",
+      e.message.includes("tsTileLayerTest") && e.message.includes(`${tilesInSet} tiles`), e.message);
+  }
+  ok("set_room_tiles: the tileset's last real tile index is accepted",
+    (await setRoomTiles(dir, "rmLayers", "L_Tiles", [{ x: 0, y: 0, index: tilesInSet - 1 }])).updated === 1);
+  await setRoomTiles(dir, "rmLayers", "L_Tiles", [{ x: 0, y: 0, index: -1 }]);
+
+  const filled = await fillRoomTiles(dir, "rmLayers", "L_Tiles", { x: 2, y: 2, width: 3, height: 2, index: 4 });
+  ok("fill_room_tiles: fills the whole rectangle inclusive of its origin cell", filled.updated === 6);
+  const filledRect = await getRoomTiles(dir, "rmLayers", "L_Tiles", { x: 2, y: 2, width: 3, height: 2 });
+  ok("fill_room_tiles: every cell in the rectangle reads back, the cell just outside does not",
+    filledRect.tiles.every(row => row.every(v => v === 4))
+    && (await getRoomTiles(dir, "rmLayers", "L_Tiles", { x: 5, y: 2, width: 1, height: 1 })).tiles[0][0] === -1);
+
+  const tilesFileBeforeRepeat = await fs.readFile(layersRoomPath);
+  const repeat = await fillRoomTiles(dir, "rmLayers", "L_Tiles", { x: 2, y: 2, width: 3, height: 2, index: 4 });
+  const tilesFileAfterRepeat = await fs.readFile(layersRoomPath);
+  ok("fill_room_tiles: repeating an identical fill reports 0 updated", repeat.updated === 0, String(repeat.updated));
+  ok("fill_room_tiles: repeating an identical fill does not touch the file",
+    tilesFileBeforeRepeat.equals(tilesFileAfterRepeat));
+  const repeatSet = await setRoomTiles(dir, "rmLayers", "L_Tiles", [{ x: 3, y: 3, index: 4 }]);
+  ok("set_room_tiles: re-writing a cell with its current value reports 0 updated and writes nothing",
+    repeatSet.updated === 0 && tilesFileBeforeRepeat.equals(await fs.readFile(layersRoomPath)));
+
+  try {
+    await fillRoomTiles(dir, "rmLayers", "L_Tiles", { x: 23, y: 0, width: 3, height: 1, index: 1 });
+    ok("fill_room_tiles: a rectangle running past the layer is an error, not a silent clip", false, "expected an error");
+  } catch (e: any) {
+    ok("fill_room_tiles: a rectangle running past the layer is an error, not a silent clip",
+      e.message.includes("runs past") && e.message.includes("25x25"), e.message);
+  }
+  try {
+    await getRoomTiles(dir, "rmLayers", "L_Tiles", { x: 24, y: 0, width: 5, height: 1 });
+    ok("get_room_tiles: an out-of-bounds rect is an error naming the bounds", false, "expected an error");
+  } catch (e: any) {
+    ok("get_room_tiles: an out-of-bounds rect is an error naming the bounds",
+      e.message.includes("25x25") && e.message.includes("valid x 0-24"), e.message);
+  }
+  try {
+    await getRoomTiles(dir, "rmLayers", "L_Effect");
+    ok("get_room_tiles: a non-tile layer is rejected, listing the room's real tile layers", false, "expected an error");
+  } catch (e: any) {
+    ok("get_room_tiles: a non-tile layer is rejected, listing the room's real tile layers",
+      e.message.includes("not a tile layer") && e.message.includes("L_Tiles"), e.message);
+  }
+  await expectThrows("set_room_tiles: rejects a nonexistent layer",
+    () => setRoomTiles(dir, "rmLayers", "L_NoSuchLayer", [{ x: 0, y: 0, index: 1 }]));
+
+  // --- Corrupt tile layers: the compressed stream must cover SerialiseWidth *
+  // SerialiseHeight, or a write would silently truncate/pad the grid ---
+  yyp = await loadYyp(dir);
+  yyp = await addRoom(dir, yyp, "rmCorrupt", { width: 64, height: 64, persistent: false });
+  await writeYyp(dir, yyp);
+  await addRoomLayer(dir, "rmCorrupt", "Bad", { layerType: "tile", tilesetName: "tsTileLayerTest" });
+  const corruptPath = path.join(dir, "rooms/rmCorrupt/rmCorrupt.yy");
+  const corruptRoom = JSON.parse(await fs.readFile(corruptPath, "utf8"));
+  const badLayer = corruptRoom.layers.find((l: any) => l.name === "Bad");
+  badLayer.tiles.SerialiseWidth = 4;
+  badLayer.tiles.SerialiseHeight = 3;
+  badLayer.tiles.TileCompressedData = [4, 9, 9, 9, 9]; // 5 values, declares 12 cells
+  await fs.writeFile(corruptPath, JSON.stringify(corruptRoom, null, 2), "utf8");
+  try {
+    await getRoomTiles(dir, "rmCorrupt", "Bad");
+    ok("get_room_tiles: a layer whose compressed data doesn't cover its grid is refused", false, "expected an error");
+  } catch (e: any) {
+    ok("get_room_tiles: a layer whose compressed data doesn't cover its grid is refused",
+      e.message.includes("refusing to edit a corrupt layer") && e.message.includes("declares 4x3 = 12 tiles"), e.message);
+  }
+  await expectThrows("set_room_tiles: refuses to write a corrupt layer rather than re-encode it",
+    () => setRoomTiles(dir, "rmCorrupt", "Bad", [{ x: 0, y: 0, index: 1 }]));
+
+  // --- Legacy read path: older GameMaker releases spell a layer folder
+  // $GMRFolder. Reading and nesting into one must keep working even though the
+  // write path only ever emits $GMRLayer. ---
+  yyp = await loadYyp(dir);
+  yyp = await addRoom(dir, yyp, "rmLegacy", { width: 64, height: 64, persistent: false });
+  await writeYyp(dir, yyp);
+  await addRoomLayer(dir, "rmLegacy", "Old Folder", { layerType: "folder" });
+  const legacyPath = path.join(dir, "rooms/rmLegacy/rmLegacy.yy");
+  const legacyRoom = JSON.parse(await fs.readFile(legacyPath, "utf8"));
+  const oldFolder = legacyRoom.layers.find((l: any) => l.name === "Old Folder");
+  delete oldFolder["$GMRLayer"];
+  oldFolder["$GMRFolder"] = "";
+  oldFolder.resourceType = "GMRFolder";
+  await fs.writeFile(legacyPath, JSON.stringify(legacyRoom, null, 2), "utf8");
+  ok("list_room_layers: reads a legacy $GMRFolder folder layer",
+    (await listRoomLayers(dir, "rmLegacy")).find(l => l.name === "Old Folder")?.type === "GMRFolder");
+  await addRoomLayer(dir, "rmLegacy", "Legacy Child", { layerType: "instance", parentLayerName: "Old Folder" });
+  const legacyAfter = JSON.parse(await fs.readFile(legacyPath, "utf8"));
+  const oldFolderAfter = legacyAfter.layers.find((l: any) => l.name === "Old Folder");
+  ok("add_room_layer: nests inside a legacy $GMRFolder folder without rewriting it",
+    oldFolderAfter.layers.length === 1 && oldFolderAfter.layers[0].name === "Legacy Child"
+    && oldFolderAfter.resourceType === "GMRFolder" && typeof oldFolderAfter["$GMRFolder"] === "string"
+    && oldFolderAfter["$GMRLayer"] === undefined,
+    JSON.stringify(Object.keys(oldFolderAfter)));
+  await addRoomLayer(dir, "rmLegacy", "New Folder", { layerType: "folder" });
+  const newFolderYy = JSON.parse(await fs.readFile(legacyPath, "utf8")).layers.find((l: any) => l.name === "New Folder");
+  ok("add_room_layer: the write path still emits $GMRLayer for a new folder",
+    newFolderYy.resourceType === "GMRLayer" && newFolderYy["$GMRLayer"] === "" && newFolderYy["$GMRFolder"] === undefined);
+
+  // --- encodeTileData: the exact inverse of decompressTileData. Several
+  // encodings decode to the same buffer, so only the decode direction is
+  // pinned here -- never the exact bytes the encoder picks. ---
+  const allEmpty = new Array(700).fill(EMPTY_TILE);
+  ok("encodeTileData: all-empty buffer round-trips",
+    JSON.stringify(decompressTileData(encodeTileData(allEmpty))) === JSON.stringify(allEmpty));
+  ok("encodeTileData: an empty buffer round-trips to an empty buffer",
+    JSON.stringify(encodeTileData([])) === JSON.stringify([]));
+  ok("encodeTileData: a single cell encodes as one literal run and round-trips",
+    JSON.stringify(encodeTileData([7])) === JSON.stringify([1, 7])
+    && JSON.stringify(decompressTileData(encodeTileData([7]))) === JSON.stringify([7]));
+  ok("encodeTileData: a single empty cell round-trips", 
+    JSON.stringify(decompressTileData(encodeTileData([EMPTY_TILE]))) === JSON.stringify([EMPTY_TILE]));
+  ok("encodeTileData: an all-empty buffer compresses to one repeat run",
+    JSON.stringify(encodeTileData(allEmpty)) === JSON.stringify([-700, EMPTY_TILE]));
+
+  // Deterministic pseudo-random buffer (a fixed LCG, so a failure is
+  // reproducible) over a tiny alphabet, which forces both repeat and literal
+  // runs.
+  let seed = 12345;
+  const nextRandom = () => {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed;
+  };
+  const randomTiles: number[] = [];
+  for (let i = 0; i < 400; i++) randomTiles.push([EMPTY_TILE, 1, 2, 3][nextRandom() % 4]);
+  ok("encodeTileData: a random buffer round-trips",
+    JSON.stringify(decompressTileData(encodeTileData(randomTiles))) === JSON.stringify(randomTiles));
+
+  const exactlyMaxRun = new Array(MAX_TILE_RUN).fill(5);
+  ok("encodeTileData: a run of exactly MAX_TILE_RUN encodes as a single run",
+    JSON.stringify(encodeTileData(exactlyMaxRun)) === JSON.stringify([-MAX_TILE_RUN, 5]));
+  ok("encodeTileData: a run of exactly MAX_TILE_RUN round-trips",
+    JSON.stringify(decompressTileData(encodeTileData(exactlyMaxRun))) === JSON.stringify(exactlyMaxRun));
+  const overMaxRun = new Array(MAX_TILE_RUN + 1).fill(5);
+  ok("encodeTileData: one cell past MAX_TILE_RUN is split into two runs",
+    JSON.stringify(encodeTileData(overMaxRun)) === JSON.stringify([-MAX_TILE_RUN, 5, 1, 5]));
+  ok("encodeTileData: one cell past MAX_TILE_RUN round-trips",
+    JSON.stringify(decompressTileData(encodeTileData(overMaxRun))) === JSON.stringify(overMaxRun));
+
+  // Both real tile layers of 261103GJ's rm_lv1 (read-only sample), captured
+  // verbatim so the round-trip runs even where the sample project isn't.
+  const realRoomTileLayers = [
+    {
+      name: "world_reality_tiles",
+      data: [-36, 81, 1, 41, -9, 42, 1, 43, -20, 0, -2, -2147483648, -2, 81, 1, 49, -9, 50, 1, 51, -20, 0, -2, -2147483648, -2, 81, 1, 49, -9, 50, 1, 51, -20, 0, -2, -2147483648, -2, 81, 1, 57, -9, 58, 1, 59, -20, 0, -2, -2147483648, 1, 81, -32, 0, -2, -2147483648, 1, 81, -32, 0, -2, -2147483648, 1, 81, -32, 0, -2, -2147483648, -2, 81, 1, 73, -19, 74, 1, 75, -10, 0, -2, -2147483648, -2, 81, -8, 90, -2, 82, -12, 90, -9, 0, -2, -2147483648, -2, 81, -31, 0, -2, -2147483648, -2, 81, -31, 0, -2, -2147483648, -2, 81, -24, 0, 1, 73, -6, 74, 1, 75, -3, 81, -24, 0, 1, 81, -7, 82, -3, 81, -24, 0, 1, 81, -7, 82, -3, 81, 1, 73, -23, 74, 1, 81, -7, 82, -3, 81, -32, 82, -3, 81, -9, 82, -7, 90, -16, 82, -3, 81, -15, 90, 1, 82, -16, 90, -37, 81],
+    },
+    {
+      name: "world_dream_tiles",
+      data: [-2, 18, 1, 10, -30, 18, 16, 10, 18, 18, 10, 18, 18, 10, 18, 18, 10, 18, 18, 10, 18, 18, 27, -18, 25, -6, 18, 3, 10, 18, 10, -6, 18, 1, 27, -18, 0, 8, 25, 18, 10, 19, 18, 10, 18, 10, -3, 18, 5, 10, 18, 10, 18, 19, -20, 0, 4, 17, 19, 19, 27, -3, 25, 1, 10, -6, 25, 1, 27, -20, 0, 3, 17, 10, 19, -26, 0, 9, 9, 10, 10, 11, 0, 0, 17, 19, 19, -25, 0, 10, 9, 18, 11, 18, 18, 27, 0, 17, 19, 19, -25, 0, 1, 25, -4, 26, -2, 0, 3, 17, 19, 19, -22, 10, -10, 0, 3, 17, 19, 10, -7, 26, 1, 10, -14, 26, 1, 10, -9, 0, 1, 17, -3, 19, -31, 0, 1, 17, -3, 19, -31, 0, 4, 17, 19, 19, 10, -24, 0, -7, 10, 1, 18, -3, 19, -24, 0, 2, 17, 18, -5, 26, -3, 18, 1, 19, -24, 0, 1, 17, -7, 18, 3, 10, 18, 18, -21, 11, 3, 9, 10, 10, -5, 18, 1, 10, -8, 18, 1, 10, -19, 18, 4, 26, 18, 18, 10, -8, 18, 1, 10, -11, 18, -4, 25, 6, 18, 25, 25, 18, 10, 10, -10, 18, 3, 11, 17, 10, -4, 18, 3, 10, 18, 18, -4, 10, 9, 18, 11, 9, 11, 18, 18, 11, 9, 10, -12, 18, 1, 11, -4, 18, 1, 10, -31, 18],
+    },
+  ];
+  for (const layer of realRoomTileLayers) {
+    const flat = decompressTileData(layer.data);
+    ok(`encodeTileData: real rm_lv1 layer "${layer.name}" decodes to 35x20 = 700 cells`,
+      flat.length === 700, String(flat.length));
+    ok(`encodeTileData: real rm_lv1 layer "${layer.name}" survives a decode/encode/decode round-trip`,
+      JSON.stringify(decompressTileData(encodeTileData(flat))) === JSON.stringify(flat));
+  }
+  const realRoomPath = "E:\\GMprojects\\261103GJ\\rooms\\rm_lv1\\rm_lv1.yy";
+  if (await fileExists(realRoomPath)) {
+    const realRoom = parseGameMakerJson(await fs.readFile(realRoomPath, "utf8"));
+    const liveTileLayers = realRoom.layers.filter((l: any) => l.resourceType === "GMRTileLayer");
+    ok("encodeTileData: the captured rm_lv1 arrays still match that real room's two tile layers",
+      liveTileLayers.length === 2
+      && JSON.stringify(liveTileLayers.map((l: any) => l.tiles.TileCompressedData))
+        === JSON.stringify(realRoomTileLayers.map(l => l.data)));
+
+    // The same two modules read against a real project room (read-only): the
+    // strong check that the layer walk and the tileset pitch work on files
+    // GameMaker itself wrote.
+    const realProjectDir = "E:\\GMprojects\\261103GJ";
+    const realLayers = await listRoomLayers(realProjectDir, "rm_lv1");
+    ok("list_room_layers: reads a real GameMaker room's layers, both tile layers included",
+      JSON.stringify(realLayers.filter(l => l.type === "GMRTileLayer").map(l => l.name))
+        === JSON.stringify(["world_reality_tiles", "world_dream_tiles"]),
+      realLayers.map(l => `${l.name}:${l.type}`).join(", "));
+    ok("list_room_layers: a real tile layer's element count is non-zero, its neighbour's layers unaffected",
+      (realLayers.find(l => l.name === "world_reality_tiles")?.elementCount ?? 0) > 0
+      && realLayers.find(l => l.name === "Instances")?.elementCount === realRoom.layers[0].instances.length);
+    const realTiles = await getRoomTiles(realProjectDir, "rm_lv1", "world_reality_tiles");
+    ok("get_room_tiles: a real rm_lv1 tile layer reads as 35x20 cells at the tileset's 32px pitch",
+      realTiles.width === 35 && realTiles.height === 20 && realTiles.gridX === 32 && realTiles.gridY === 32
+      && realTiles.tiles.length === 20 && realTiles.tiles[0].length === 35,
+      `${realTiles.width}x${realTiles.height} @ ${realTiles.gridX}`);
+  } else {
+    skip("encodeTileData: live rm_lv1 comparison (sample project not present on this machine)");
+    skip("list_room_layers/get_room_tiles: real rm_lv1 room (sample project not present on this machine)");
+  }
+
+  // --- Tool registry. src/index.ts is imported for the real tool list and the
+  // real schemas (it only connects a transport when it is the process entry
+  // point); the dispatch switch is still asserted as source text, so a
+  // commented-out case cannot pass the check. ---
+  const indexSource = await fs.readFile(path.join(process.cwd(), "src", "index.ts"), "utf8");
+  const readmeSource = await fs.readFile(path.join(process.cwd(), "README.md"), "utf8");
+  const newToolNames = ["edit_object", "list_room_layers", "add_room_layer", "remove_room_layer",
+    "set_room_layer", "get_room_tiles", "set_room_tiles", "fill_room_tiles"];
+  for (const name of newToolNames) {
+    ok(`registry: ${name} is in TOOL_DEFS`, TOOL_DEFS.some(d => d.name === name));
+    ok(`registry: ${name} has a live dispatchTool case`, indexSource.includes(`case "${name}":`));
+  }
+  ok("registry: TOOL_DEFS declares exactly 53 tools (45 existing + 8 new)", TOOL_DEFS.length === 53, String(TOOL_DEFS.length));
+  const declaredTools = (indexSource.match(/^  \{ name: "/gm) ?? []).length;
+  ok("registry: the source registers exactly 53 TOOL_DEFS entries", declaredTools === 53, String(declaredTools));
+  const dispatchCases = (indexSource.match(/^\s*case "[A-Za-z_]+":/gm) ?? []).length;
+  ok("registry: dispatchTool has exactly 53 uncommented cases", dispatchCases === 53, String(dispatchCases));
+  ok("registry: all 8 new tools are documented in README.md",
+    newToolNames.every(n => readmeSource.includes(`\`${n}\``)),
+    newToolNames.filter(n => !readmeSource.includes(`\`${n}\``)).join(","));
+
+  // gravityScale must fail where an MCP client meets it: the zod schema, not
+  // only the module's runtime check.
+  const gravityParsed = EditObjectSchema.safeParse({ projectDir: dir, objectName: "objTest", physics: { gravityScale: 1 } });
+  ok("registry: physics.gravityScale is rejected by the tool schema itself, not just the module",
+    !gravityParsed.success && /gravityScale cannot be stored/.test(gravityParsed.error?.issues[0]?.message ?? ""),
+    gravityParsed.success ? "schema accepted gravityScale" : gravityParsed.error?.issues[0]?.message);
+  ok("registry: physics without gravityScale still parses",
+    EditObjectSchema.safeParse({ projectDir: dir, objectName: "objTest", physics: { density: 1 } }).success);
+  const physicsSchemaSource = indexSource.slice(
+    indexSource.indexOf("const ObjectPhysicsSchema"), indexSource.indexOf("const VariableDefinitionSchema"));
+  ok("registry: gravityScale stays documented as unsupported in the schema",
+    /gravityScale: z[\s\S]{0,400}NOT SUPPORTED/.test(physicsSchemaSource));
+  const varDefSchemaSource = indexSource.slice(
+    indexSource.indexOf("const VariableDefinitionSchema"), indexSource.indexOf("const EditObjectSchema"));
+  ok("registry: variableDefinitions.type is limited to real|asset (the only verified varType encodings)",
+    /\.enum\(\["real", "asset"\]\)/.test(varDefSchemaSource));
 
   await fs.rm(dir, { recursive: true, force: true });
 

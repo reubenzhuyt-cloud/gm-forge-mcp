@@ -3,3 +3,5 @@ dist/
 *.log
 .DS_Store
 *.tsbuildinfo
+# Interrupted atomic writes (writeRoomYy/writeYyp leave .<name>.tmp-<uuid> behind)
+.*.tmp-*

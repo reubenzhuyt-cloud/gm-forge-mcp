@@ -52,9 +52,11 @@ Add to your MCP client config (e.g. Claude Desktop's `claude_desktop_config.json
 
 **Scripts** -- `add_script`, `edit_script`, `get_script_info`
 
-**Objects** -- `add_object`, `add_object_event`, `get_object_info`
+**Objects** -- `add_object`, `add_object_event`, `edit_object`, `get_object_info`
 
-**Rooms** -- `add_room`, `edit_room`, `add_room_instance`, `reorder_room`, `move_room_relative`, `get_room_info`, `find_tile_region`
+**Rooms** -- `add_room`, `edit_room`, `add_room_instance`, `reorder_room`, `move_room_relative`, `get_room_info`, `find_tile_region`, `list_room_layers`, `add_room_layer`, `remove_room_layer`, `set_room_layer`
+
+**Room tiles** -- `get_room_tiles`, `set_room_tiles`, `fill_room_tiles`
 
 **Sprites** -- `add_sprite_from_images`, `edit_sprite`, `get_sprite_info`
 

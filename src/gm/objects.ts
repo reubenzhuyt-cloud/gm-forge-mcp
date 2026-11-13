@@ -207,3 +207,213 @@ export async function addObjectEvent(
   await fs.writeFile(files.yyFile, JSON.stringify(obj, null, 2), "utf8");
   await fs.writeFile(path.join(files.dir, stubFileName), code, "utf8");
 }
+
+export interface ObjectEditOptions {
+  spriteName?: string | null;
+  spriteMaskName?: string | null;
+  parentObjectName?: string | null;
+  solid?: boolean;
+  visible?: boolean;
+  persistent?: boolean;
+  physics?: {
+    enabled?: boolean;
+    density?: number;
+    friction?: number;
+    restitution?: number;
+    collisionGroup?: number;
+    kinematic?: boolean;
+    sensor?: boolean;
+    shape?: number;
+    startAwake?: boolean;
+    angularDamping?: number;
+    linearDamping?: number;
+    gravityScale?: number;
+  };
+  variableDefinitions?: Array<{
+    name: string;
+    value: string;
+    type?: "real" | "string" | "boolean" | "expression" | "asset";
+  }> | null;
+}
+
+// Option names map onto the physics_* keys GameMaker actually writes (see
+// NO_PHYSICS) -- the friendly name never reaches the .yy.
+const PHYSICS_FIELDS = {
+  density: "physicsDensity",
+  friction: "physicsFriction",
+  restitution: "physicsRestitution",
+  collisionGroup: "physicsGroup",
+  kinematic: "physicsKinematic",
+  sensor: "physicsSensor",
+  shape: "physicsShape",
+  startAwake: "physicsStartAwake",
+  angularDamping: "physicsAngularDamping",
+  linearDamping: "physicsLinearDamping"
+} as const;
+
+function restoreDefaultPhysics(obj: any, changes: string[]): void {
+  for (const [key, value] of Object.entries(NO_PHYSICS)) {
+    const next = key === "physicsShapePoints" ? [] : value;
+    if (JSON.stringify(obj[key]) !== JSON.stringify(next)) {
+      obj[key] = next;
+      changes.push(`${key}=${JSON.stringify(next)}`);
+    }
+  }
+}
+
+function applyPhysics(obj: any, physics: NonNullable<ObjectEditOptions["physics"]>, changes: string[]): void {
+  // A GMObject stores no gravity scale -- GameMaker's gravity is a room
+  // instance setting, so there is no key here to write to.
+  if (physics.gravityScale !== undefined) {
+    throw new Error("physics.gravityScale cannot be stored: a GMObject .yy has no gravity-scale key (GameMaker keeps gravity per room instance)");
+  }
+  if (physics.enabled === false) {
+    restoreDefaultPhysics(obj, changes);
+  } else if (physics.enabled === true && obj.physicsObject !== true) {
+    obj.physicsObject = true;
+    changes.push("physicsObject=true");
+  }
+  for (const [optionKey, yyKey] of Object.entries(PHYSICS_FIELDS)) {
+    const next = (physics as any)[optionKey];
+    if (next === undefined || obj[yyKey] === next) continue;
+    obj[yyKey] = next;
+    changes.push(`${yyKey}=${String(next)}`);
+  }
+}
+
+async function resourceRef(
+  projectDir: string,
+  folder: "sprites" | "objects",
+  name: string,
+  label: string
+): Promise<{ name: string; path: string }> {
+  assertSafeResourceName(name);
+  const expected = path.join(projectDir, folder, name, `${name}.yy`);
+  if (!(await fileExists(expected))) {
+    throw new Error(`${label} "${name}" does not exist (expected ${expected})`);
+  }
+  return { name, path: `${folder}/${name}/${name}.yy` };
+}
+
+async function applyRefField(
+  obj: any,
+  key: string,
+  name: string | null,
+  projectDir: string,
+  folder: "sprites" | "objects",
+  label: string,
+  changes: string[]
+): Promise<void> {
+  const next = name === null ? null : await resourceRef(projectDir, folder, name, label);
+  if (JSON.stringify(obj[key]) === JSON.stringify(next)) return;
+  obj[key] = next;
+  changes.push(`${key}=${name ?? "null"}`);
+}
+
+// Key set and varType integers copied from a real IDE-authored object
+// (obj_transit_trigger in the 261103GJ project). Only varType 0 (real) and
+// 4 (asset) appear in any GMObject on this machine, so the other types have
+// no verified encoding to write and are rejected instead of guessed at.
+function variableDefinitionVarType(type: string | undefined): number {
+  switch (type ?? "real") {
+    case "real":
+      return 0;
+    case "asset":
+      return 4;
+    default:
+      throw new Error(`Variable definition type "${type}" is not supported: no real GameMaker sample available to verify its .yy encoding`);
+  }
+}
+
+function variableDefinitionEntry(def: NonNullable<ObjectEditOptions["variableDefinitions"]>[number]) {
+  assertSafeResourceName(def.name);
+  return {
+    $GMObjectProperty: "v2",
+    "%Name": def.name,
+    filters: [] as any[],
+    listItems: [] as any[],
+    multiselect: false,
+    name: def.name,
+    rangeEnabled: false,
+    rangeMax: 10,
+    rangeMin: 0,
+    resourceType: "GMObjectProperty",
+    resourceVersion: RESOURCE_VERSIONS.object,
+    value: def.value,
+    varType: variableDefinitionVarType(def.type)
+  };
+}
+
+/**
+ * Edits one existing object's own .yy in place: sprite/mask/parent refs,
+ * solidity/visibility/persistence, the physics block, and object variable
+ * definitions. Nothing in the YYP changes, and keys this function does not
+ * touch keep their original order and values.
+ *
+ * undefined leaves a field alone, null clears a reference (spriteMaskId,
+ * parentObjectId) or empties the variable definitions.
+ */
+export async function editObject(
+  projectDir: string,
+  objectName: string,
+  opts: ObjectEditOptions
+): Promise<string> {
+  assertSafeResourceName(objectName);
+  if (!Object.values(opts).some(value => value !== undefined)) {
+    throw new Error(`Nothing to change on object "${objectName}": no editable fields were provided`);
+  }
+
+  const files = objectFiles(projectDir, objectName);
+  const obj = await readObjectYy(files.yyFile, objectName);
+  const changes: string[] = [];
+
+  if (opts.spriteName !== undefined) {
+    await applyRefField(obj, "spriteId", opts.spriteName, projectDir, "sprites", "Sprite", changes);
+  }
+  if (opts.spriteMaskName !== undefined) {
+    await applyRefField(obj, "spriteMaskId", opts.spriteMaskName, projectDir, "sprites", "Sprite mask", changes);
+  }
+  if (opts.parentObjectName !== undefined) {
+    if (opts.parentObjectName === objectName) {
+      throw new Error(`Object "${objectName}" cannot be its own parent`);
+    }
+    await applyRefField(obj, "parentObjectId", opts.parentObjectName, projectDir, "objects", "Parent object", changes);
+  }
+  if (opts.solid !== undefined && obj.solid !== opts.solid) {
+    obj.solid = opts.solid;
+    changes.push(`solid=${opts.solid}`);
+  }
+  if (opts.visible !== undefined && obj.visible !== opts.visible) {
+    obj.visible = opts.visible;
+    changes.push(`visible=${opts.visible}`);
+  }
+  if (opts.persistent !== undefined && obj.persistent !== opts.persistent) {
+    obj.persistent = opts.persistent;
+    changes.push(`persistent=${opts.persistent}`);
+  }
+  if (opts.physics !== undefined) {
+    applyPhysics(obj, opts.physics, changes);
+  }
+  if (opts.variableDefinitions !== undefined) {
+    const next = opts.variableDefinitions === null ? [] : opts.variableDefinitions.map(variableDefinitionEntry);
+    const seen = new Set<string>();
+    for (const entry of next) {
+      if (seen.has(entry.name)) {
+        throw new Error(`Duplicate variable definition "${entry.name}" on object "${objectName}"`);
+      }
+      seen.add(entry.name);
+    }
+    // `properties` is always an array -- GameMaker has no null form of it,
+    // so clearing means an empty list.
+    if (JSON.stringify(obj.properties ?? null) !== JSON.stringify(next)) {
+      obj.properties = next;
+      changes.push(`properties=${next.length} definition${next.length === 1 ? "" : "s"}`);
+    }
+  }
+
+  if (changes.length === 0) {
+    return `✓ Object "${objectName}" unchanged -- no field differed from the requested values`;
+  }
+  await fs.writeFile(files.yyFile, JSON.stringify(obj, null, 2), "utf8");
+  return `✓ Updated object "${objectName}": ${changes.join(", ")}`;
+}
