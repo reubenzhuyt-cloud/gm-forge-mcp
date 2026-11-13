@@ -3,6 +3,7 @@ import path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import type { Yyp } from "@bscotch/yy";
+import { atomicWriteJson } from "./atomic.js";
 import { ensureFolder, ensureTextureGroup, validateResourceName, RESOURCE_VERSIONS, registerResource, parseGameMakerJson, assertSafeResourceName } from "./yyp.js";
 
 const execFileAsync = promisify(execFile);
@@ -129,11 +130,7 @@ export async function addFont(
     usesSDF: false
   };
 
-  await fs.writeFile(
-    path.join(dir, `${fontName}.yy`),
-    JSON.stringify(fontYy, null, 2),
-    "utf8"
-  );
+  await atomicWriteJson(path.join(dir, `${fontName}.yy`), fontYy);
 
   ensureFolder(yyp, "Fonts");
   ensureTextureGroup(yyp);
@@ -184,6 +181,6 @@ export async function editFont(
     font.styleName = fontStyleName(font.bold, font.italic);
   }
 
-  await fs.writeFile(yyPath, JSON.stringify(font, null, 2), "utf8");
+  await atomicWriteJson(yyPath, font);
   return { warning };
 }

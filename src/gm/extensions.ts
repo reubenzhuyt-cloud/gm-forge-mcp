@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
+import { atomicWriteJson } from "./atomic.js";
 import { ensureFolder, registerResource, validateResourceName, RESOURCE_VERSIONS } from "./yyp.js";
 
 // Real GameMaker extension .yy files carry ~40 per-platform fields
@@ -83,11 +84,7 @@ export async function addExtension(projectDir: string, yyp: Yyp, name: string): 
 
   const dir = path.join(projectDir, "extensions", name);
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(
-    path.join(dir, `${name}.yy`),
-    JSON.stringify(newExtensionYy(name), null, 2),
-    "utf8"
-  );
+  await atomicWriteJson(path.join(dir, `${name}.yy`), newExtensionYy(name));
 
   ensureFolder(yyp, "Extensions");
   registerResource(yyp, name, `extensions/${name}/${name}.yy`);

@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
+import { atomicWriteFile, atomicWriteJson } from "./atomic.js";
 import { ensureFolder, registerResource, validateResourceName, assertSafeResourceName, RESOURCE_VERSIONS } from "./yyp.js";
 
 interface ScriptFiles {
@@ -38,8 +39,8 @@ export async function addScript(projectDir: string, yyp: Yyp, name: string, code
   const files = scriptFiles(projectDir, name);
 
   await fs.mkdir(files.dir, { recursive: true });
-  await fs.writeFile(files.gmlFile, code, "utf8");
-  await fs.writeFile(files.yyFile, JSON.stringify(newScriptYy(name), null, 2), "utf8");
+  await atomicWriteFile(files.gmlFile, code);
+  await atomicWriteJson(files.yyFile, newScriptYy(name));
 
   ensureFolder(yyp, "Scripts");
   registerResource(yyp, name, files.catalogPath);
@@ -73,7 +74,7 @@ export async function editScript(
   await requireScriptFile(gmlFile, name);
 
   if (mode === "replace") {
-    await fs.writeFile(gmlFile, code, "utf8");
+    await atomicWriteFile(gmlFile, code);
     return;
   }
 
@@ -85,5 +86,5 @@ export async function editScript(
     throw new Error(`Script "${name}" already contains this exact code -- refusing to append a duplicate. Use mode "replace" if this is intentional.`);
   }
   const separator = current.endsWith("\n") ? "\n" : "\n\n";
-  await fs.writeFile(gmlFile, `${current}${separator}${code}`, "utf8");
+  await atomicWriteFile(gmlFile, `${current}${separator}${code}`);
 }

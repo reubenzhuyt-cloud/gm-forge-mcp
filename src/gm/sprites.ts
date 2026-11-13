@@ -2,6 +2,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import crypto from "crypto";
 import type { Yyp } from "@bscotch/yy";
+import { atomicCopyFile, atomicWriteJson } from "./atomic.js";
 import { ensureFolder, ensureTextureGroup, registerResource, validateResourceName, RESOURCE_VERSIONS, parseGameMakerJson, assertSafeResourceName } from "./yyp.js";
 
 interface ImageSize {
@@ -64,17 +65,17 @@ async function importFrames(framesDir: string, files: string[], spriteDir: strin
     const frameId = crypto.randomUUID();
     frameIds.push(frameId);
 
-    await fs.copyFile(source, path.join(spriteDir, `${frameId}.png`));
+    await atomicCopyFile(source, path.join(spriteDir, `${frameId}.png`));
 
     const layerDir = path.join(spriteDir, "layers", frameId);
     await fs.mkdir(layerDir, { recursive: true });
-    await fs.copyFile(source, path.join(layerDir, `${layerId}.png`));
+    await atomicCopyFile(source, path.join(layerDir, `${layerId}.png`));
   }
 
   return { frameIds, size: size! };
 }
 
-function frameEntry(frameId: string) {
+export function frameEntry(frameId: string) {
   return {
     name: frameId,
     resourceType: "GMSpriteFrame",
@@ -99,7 +100,7 @@ function layerEntry(layerId: string) {
   };
 }
 
-function frameKeyframe(spriteName: string, frameId: string, index: number) {
+export function frameKeyframe(spriteName: string, frameId: string, index: number) {
   return {
     id: crypto.randomUUID(),
     Key: index,
@@ -236,11 +237,7 @@ export async function addSpriteFromImages(projectDir: string, yyp: Yyp, name: st
   const layerId = crypto.randomUUID();
   const { frameIds, size } = await importFrames(framesDir, sources, spriteDir, layerId);
 
-  await fs.writeFile(
-    path.join(spriteDir, `${name}.yy`),
-    JSON.stringify(spriteYy(name, size, frameIds, layerId), null, 2),
-    "utf8"
-  );
+  await atomicWriteJson(path.join(spriteDir, `${name}.yy`), spriteYy(name, size, frameIds, layerId));
 
   ensureFolder(yyp, "Sprites");
   ensureTextureGroup(yyp);
@@ -296,5 +293,5 @@ export async function editSprite(
   if (options.bbox_right !== undefined) sprite.bbox_right = options.bbox_right;
   if (options.bbox_bottom !== undefined) sprite.bbox_bottom = options.bbox_bottom;
 
-  await fs.writeFile(yyPath, JSON.stringify(sprite, null, 2), "utf8");
+  await atomicWriteJson(yyPath, sprite);
 }

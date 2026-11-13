@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import crypto from "crypto";
+import { atomicWriteJson } from "./atomic.js";
 import { parseGameMakerJson, assertSafeResourceName, RESOURCE_VERSIONS, fileExists } from "./yyp.js";
 
 export interface InstanceOptions {
@@ -80,7 +81,7 @@ export async function addRoomInstance(
     path: `rooms/${roomName}/${roomName}.yy`
   });
 
-  await fs.writeFile(roomYyPath, JSON.stringify(room, null, 2), "utf8");
+  await atomicWriteJson(roomYyPath, room);
 
   return { instanceName };
 }

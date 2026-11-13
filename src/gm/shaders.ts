@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
+import { atomicWriteFile, atomicWriteJson } from "./atomic.js";
 import { ensureFolder, validateResourceName, RESOURCE_VERSIONS, registerResource, assertSafeResourceName, fileExists } from "./yyp.js";
 
 const DEFAULT_VERTEX_SHADER = `attribute vec3 in_Position;
@@ -45,8 +46,8 @@ export async function addShader(
   const dir = path.join(projectDir, "shaders", shaderName);
   await fs.mkdir(dir, { recursive: true });
 
-  await fs.writeFile(path.join(dir, `${shaderName}.vsh`), vertexCode, "utf8");
-  await fs.writeFile(path.join(dir, `${shaderName}.fsh`), fragmentCode, "utf8");
+  await atomicWriteFile(path.join(dir, `${shaderName}.vsh`), vertexCode);
+  await atomicWriteFile(path.join(dir, `${shaderName}.fsh`), fragmentCode);
 
   const shaderYy = {
     "$GMShader": "",
@@ -61,11 +62,7 @@ export async function addShader(
     type: 1
   };
 
-  await fs.writeFile(
-    path.join(dir, `${shaderName}.yy`),
-    JSON.stringify(shaderYy, null, 2),
-    "utf8"
-  );
+  await atomicWriteJson(path.join(dir, `${shaderName}.yy`), shaderYy);
 
   ensureFolder(yyp, "Shaders");
 
@@ -96,6 +93,6 @@ export async function editShader(
     throw new Error(`Shader "${shaderName}" does not exist (expected ${vshPath})`);
   }
 
-  if (options.vertexCode !== undefined) await fs.writeFile(vshPath, options.vertexCode, "utf8");
-  if (options.fragmentCode !== undefined) await fs.writeFile(path.join(dir, `${shaderName}.fsh`), options.fragmentCode, "utf8");
+  if (options.vertexCode !== undefined) await atomicWriteFile(vshPath, options.vertexCode);
+  if (options.fragmentCode !== undefined) await atomicWriteFile(path.join(dir, `${shaderName}.fsh`), options.fragmentCode);
 }

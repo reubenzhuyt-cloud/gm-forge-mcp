@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
+import { atomicWriteJson } from "./atomic.js";
 import { ensureFolder, registerResource, validateResourceName, RESOURCE_VERSIONS } from "./yyp.js";
 
 // Ground truth: a real GMAnimCurve captured from @bscotch/yy's own sample
@@ -51,11 +52,7 @@ export async function addAnimCurve(projectDir: string, yyp: Yyp, name: string): 
 
   const dir = path.join(projectDir, "animcurves", name);
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(
-    path.join(dir, `${name}.yy`),
-    JSON.stringify(newAnimCurveYy(name), null, 2),
-    "utf8"
-  );
+  await atomicWriteJson(path.join(dir, `${name}.yy`), newAnimCurveYy(name));
 
   ensureFolder(yyp, "Animation Curves");
   registerResource(yyp, name, `animcurves/${name}/${name}.yy`);

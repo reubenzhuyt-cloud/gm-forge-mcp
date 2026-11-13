@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
+import { atomicWriteFile } from "./atomic.js";
 import { findReferences } from "./references.js";
 import type { ResourceCategory } from "./delete.js";
 import { assertSafeResourceName, parseGameMakerJson, fileExists } from "./yyp.js";
@@ -139,7 +140,7 @@ export async function renameResource(
     for (const file of externalFiles) {
       const content = await fs.readFile(file, "utf8");
       modifiedExternalFiles.push({ file, originalContent: content });
-      await fs.writeFile(file, renameInFile(content, path.extname(file), oldName, newName), "utf8");
+      await atomicWriteFile(file, renameInFile(content, path.extname(file), oldName, newName));
     }
 
     // 2. Rewrite the resource's OWN file contents (its "name"/"%Name" fields,
@@ -153,7 +154,7 @@ export async function renameResource(
       if (![".yy", ".gml"].includes(ext)) continue;
       const content = await fs.readFile(filePath, "utf8");
       modifiedOwnFiles.push({ filePath, originalContent: content });
-      await fs.writeFile(filePath, renameInFile(content, ext, oldName, newName), "utf8");
+      await atomicWriteFile(filePath, renameInFile(content, ext, oldName, newName));
     }
 
     // 3. Rename the resource's own files (oldName.yy -> newName.yy,
@@ -209,10 +210,10 @@ export async function renameResource(
       try { await fs.rename(to, from); } catch (e: any) { rollbackErrors.push(`restore ${to}: ${e.message}`); }
     }
     for (const { filePath, originalContent } of modifiedOwnFiles) {
-      try { await fs.writeFile(filePath, originalContent, "utf8"); } catch (e: any) { rollbackErrors.push(`restore ${filePath}: ${e.message}`); }
+      try { await atomicWriteFile(filePath, originalContent); } catch (e: any) { rollbackErrors.push(`restore ${filePath}: ${e.message}`); }
     }
     for (const { file, originalContent } of modifiedExternalFiles) {
-      try { await fs.writeFile(file, originalContent, "utf8"); } catch (e: any) { rollbackErrors.push(`restore ${file}: ${e.message}`); }
+      try { await atomicWriteFile(file, originalContent); } catch (e: any) { rollbackErrors.push(`restore ${file}: ${e.message}`); }
     }
     if (rollbackErrors.length === 0) {
       throw new Error(`Rename failed and was fully rolled back -- no changes were left in place. Original error: ${originalError.message}`);

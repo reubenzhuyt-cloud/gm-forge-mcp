@@ -1,7 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
-import crypto from "crypto";
 import { Yy, type Yyp } from "@bscotch/yy";
+import { atomicReplaceWith } from "./atomic.js";
 
 const YYP_NAME = (name: string) => `${name}.yyp`;
 
@@ -187,10 +187,9 @@ export async function ensureProjectScaffold(projectDir: string, name: string): P
   return yyp as Yyp;
 }
 
-/**
- * Load an existing YYP from a project directory
- */
-export async function loadYyp(projectDir: string): Promise<Yyp> {
+// The one .yyp a project directory holds, resolved once so loadYyp, loadRawYyp
+// and writeYyp agree on it.
+async function yypPathIn(projectDir: string): Promise<string> {
   const files = await fs.readdir(projectDir);
   const yypFiles = files.filter((f: string) => f.endsWith(".yyp"));
 
@@ -201,25 +200,177 @@ export async function loadYyp(projectDir: string): Promise<Yyp> {
     throw new Error(`${projectDir} contains ${yypFiles.length} .yyp files (${yypFiles.join(", ")}) -- can't tell which is the project; remove the extra one`);
   }
 
-  const fullPath = path.join(projectDir, yypFiles[0]);
+  return path.join(projectDir, yypFiles[0]);
+}
+
+/**
+ * Load an existing YYP from a project directory
+ */
+export async function loadYyp(projectDir: string): Promise<Yyp> {
+  const fullPath = await yypPathIn(projectDir);
   return await Yy.read(fullPath, Yy.schemas.project) as Yyp;
 }
 
-// Writes to a temp file and renames over the real path. Yy.write on its own
-// writes straight onto the target, so a crash mid-write leaves the whole
-// project's manifest truncated; the rename is atomic, so there's no window
-// where that can happen here.
+/**
+ * The same file `loadYyp` picks, as raw JSON: no schema, so the `$GM<Class>`
+ * tags and every key the schema does not model are still there. For readers
+ * that must preserve fields the typed object cannot carry (an IncludedFiles
+ * entry's extra keys); writers still go through `writeYyp`.
+ */
+export async function loadRawYyp(
+  projectDir: string
+): Promise<{ yypPath: string; text: string; parsed: any }> {
+  const yypPath = await yypPathIn(projectDir);
+  const text = await fs.readFile(yypPath, "utf8");
+  return { yypPath, text, parsed: parseGameMakerJson(text) };
+}
+
+// zod's project schema validates by parsing, and zod's object parsing silently
+// DROPS every key the schema does not name. Two fields GameMaker 2026.0.0.16
+// really writes are named by no schema: the `$GM<Class>` schema-version tag on
+// an audio group (`"$GMAudioGroup":"v1"`) and its `exportDir`. A plain
+// load -> write therefore used to turn
+//   {"$GMAudioGroup":"v1",...,"exportDir":"","targets":-1}
+// into
+//   {"$GMAudioGroup":"",...,"targets":-1}
+// i.e. declare a legacy record and lose a field -- on every `.yyp` write in the
+// tree, not just the ones this subproject added.
+//
+// The tags are real version markers, not decoration: they differ per class and
+// per GameMaker release in one captured project (`$GMProject`/`$GMAudioGroup`
+// /`$GMFolder`... "v1", `$GMObjectProperty` and `$GMSound` "v2", `$GMRInstance`
+// "v4", `$GMMainOptions` "v5", `$GMWindowsOptions`/`$GMRedditOptions` "v2"), and
+// @bscotch/yy's own stringifier rewrites `$GMScript`/`$GMSound`/... to "v1"/
+// "v2" based on `MetaData.IDEVersion`. Writing "" is a downgrade, so the file on
+// disk wins over the schema's silence: the restorable keys are copied back
+// before serialisation. Only ABSENT keys are filled in, so nothing an edit
+// actually changed can be resurrected, and entries are matched by identity
+// (`folderPath`, `id.path`, `roomId.path`, `filePath/name`, `name`) rather than
+// by index, because `resources`/`Folders`/`IncludedFiles` are reordered on write.
+//
+// Only the two shapes the schema is KNOWN to drop are restored -- the `$GM<Class>`
+// tags and an audio group's `exportDir`. Filling every absent key instead would
+// resurrect a key a tool deliberately removed and would re-add a top-level
+// `"Options": []`, undoing the delete `yypSchema`'s own preprocess performs.
+//
+// One limit the restore cannot fix and must not fight: `Yy.stringify` sets
+// `resourceVersion: "2.0"` on every record it recognises, and that key IS
+// schema-named, so a record still at an older version (1.0/1.3) is upgraded on
+// write. That is the library's migration, not a loss, and every GameMaker
+// 2026.0.0.16 file already says 2.0.
+const RESTORABLE_KEYS = new Set(["exportDir"]);
+
+function isRestorableKey(key: string): boolean {
+  return key.startsWith("$GM") || RESTORABLE_KEYS.has(key);
+}
+
+function yypEntryIdentity(record: any): string | null {
+  if (!record || typeof record !== "object") return null;
+  if (typeof record.folderPath === "string") return `folderPath:${record.folderPath}`;
+  if (typeof record.id?.path === "string") return `path:${record.id.path}`;
+  if (typeof record.roomId?.path === "string") return `roomId:${record.roomId.path}`;
+  if (typeof record.name === "string") return `filePath:${record.filePath ?? ""}/name:${record.name}`;
+  return null;
+}
+
+function restoreDroppedKeys(original: any, target: any): void {
+  if (Array.isArray(original) && Array.isArray(target)) {
+    const byIdentity = new Map<string, any>();
+    original.forEach((record) => {
+      const identity = yypEntryIdentity(record);
+      if (identity !== null && !byIdentity.has(identity)) byIdentity.set(identity, record);
+    });
+    target.forEach((record, i) => {
+      // An entry that carries an identity is matched only by that identity: a
+      // deleted entry must not hand its dropped keys to whichever entry now
+      // sits at the same index. Records with no identity (plain values) fall
+      // back to the position, which is where both sides came from.
+      const identity = yypEntryIdentity(record);
+      const match = identity === null ? original[i] : byIdentity.get(identity);
+      if (match !== undefined) restoreDroppedKeys(match, record);
+    });
+    return;
+  }
+  if (!original || !target || typeof original !== "object" || typeof target !== "object") return;
+  for (const [key, value] of Object.entries(original)) {
+    if (!(key in target)) {
+      if (isRestorableKey(key)) target[key] = value;
+      continue;
+    }
+    restoreDroppedKeys(value, (target as any)[key]);
+  }
+}
+
+// IncludedFiles entries are data, not resources, and the tool contract promises
+// that an entry's extra (unmodelled) keys survive an overwrite. That cannot ride
+// on the $GM*/exportDir rule above, so this one list restores every absent key of
+// a matched entry. It is safe to be this broad here: no tool removes a single key
+// from an entry (removal is whole-entry, and a whole-entry delete finds no
+// identity match, so nothing is resurrected).
+function restoreIncludedFileExtras(original: any, target: any): void {
+  if (!Array.isArray(original) || !Array.isArray(target)) return;
+  const identityOf = (entry: any) => `${String(entry?.filePath ?? "")}/${String(entry?.name ?? "")}`;
+  const byIdentity = new Map<string, any>();
+  for (const entry of original) {
+    const identity = identityOf(entry);
+    if (!byIdentity.has(identity)) byIdentity.set(identity, entry);
+  }
+  for (const entry of target) {
+    if (!entry || typeof entry !== "object") continue;
+    const match = byIdentity.get(identityOf(entry));
+    if (!match) continue;
+    for (const [key, value] of Object.entries(match)) {
+      if (!(key in entry)) entry[key] = value;
+    }
+  }
+}
+
+// Best-effort only: restoration is fidelity, not correctness, so a .yyp that
+// cannot be read back (locked by the IDE, a permission error, an encoding
+// surprise) must never block a save that used to succeed. Any error means "no
+// restoration", not a failed write -- parseGameMakerJson's own failures are
+// handled by the caller the same way.
+async function readTextIfExists(file: string): Promise<string | null> {
+  try {
+    return await fs.readFile(file, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+// Writes through atomicReplaceWith: temp file, then rename over the real path,
+// with the shared locked-file message. @bscotch/yy still produces the bytes (it
+// emits GameMaker's own key-sort order, trailing commas and formatting, so a
+// plain JSON.stringify would restyle the whole file); atomicReplaceWith owns the
+// temp name, the rename and the EPERM wording. A crash mid-write therefore
+// leaves the real .yyp untouched instead of truncated.
+//
+// Byte-identical for a project already at resourceVersion 2.0, which is every
+// file GameMaker 2026.0.0.16 writes (and every no-op save of the reference
+// project, tested). It is NOT byte-identical for a legacy record still at 1.0/
+// 1.3: `Yy.stringify` sets `resourceVersion: "2.0"` on typed records and that
+// key is schema-named, so the upgrade is the library's and cannot be undone
+// without defeating the schema that validates the file.
 export async function writeYyp(projectDir: string, yyp: Yyp): Promise<void> {
   const filename = yyp.name.endsWith(".yyp") ? yyp.name : `${yyp.name}.yyp`;
   const fullPath = path.join(projectDir, filename);
-  const tempPath = path.join(projectDir, `.${filename}.tmp-${crypto.randomUUID()}`);
-  try {
-    await Yy.write(tempPath, yyp, Yy.schemas.project);
-    await fs.rename(tempPath, fullPath);
-  } catch (e) {
-    await fs.rm(tempPath, { force: true }).catch(() => {});
-    throw e;
+  // The schema's parse is done here rather than inside Yy.write so the dropped
+  // keys can be restored in between; Yy.stringify then runs without a schema,
+  // which is why it neither re-parses nor re-drops them.
+  const populated = Yy.populate(yyp, "project") as any;
+  const original = await readTextIfExists(fullPath);
+  if (original !== null) {
+    try {
+      const parsed = parseGameMakerJson(original);
+      restoreDroppedKeys(parsed, populated);
+      restoreIncludedFileExtras(parsed?.IncludedFiles, populated?.IncludedFiles);
+    } catch {
+      // An unparseable .yyp is loadYyp's error to report, not this one's: write
+      // the schema's own output rather than inventing a second failure.
+    }
   }
+  const text = Yy.stringify(populated);
+  await atomicReplaceWith(fullPath, (tempPath) => fs.writeFile(tempPath, text, "utf8"));
 }
 
 // Format check only, no collision check -- for tools operating on an

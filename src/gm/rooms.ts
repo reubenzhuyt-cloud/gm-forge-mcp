@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
+import { atomicWriteFile } from "./atomic.js";
 import { ensureFolder, validateResourceName, RESOURCE_VERSIONS, registerResource } from "./yyp.js";
 import { readRoomYy, writeRoomYy, ROOM_LAYER_GRID } from "./room_layers.js";
 
@@ -42,7 +43,7 @@ export async function addRoom(
 
   const hasCreationCode = options.creationCode !== undefined && options.creationCode.length > 0;
   if (hasCreationCode) {
-    await fs.writeFile(path.join(dir, "RoomCreationCode.gml"), options.creationCode!, "utf8");
+    await atomicWriteFile(path.join(dir, "RoomCreationCode.gml"), options.creationCode!);
   }
 
   const view = {

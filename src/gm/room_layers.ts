@@ -1,6 +1,6 @@
 import { promises as fs } from "fs";
-import crypto from "crypto";
 import path from "path";
+import { atomicWriteFile } from "./atomic.js";
 import { parseGameMakerJson, assertSafeResourceName, fileExists } from "./yyp.js";
 import { decompressTileData, EMPTY_TILE } from "./room_tiles.js";
 
@@ -45,26 +45,13 @@ export async function readRoomYy(projectDir: string, roomName: string): Promise<
   }
 }
 
-// Temp file + rename in the same directory, mirroring writeYyp: a crash mid-write
-// can't leave a truncated room .yy behind. Single-file atomicity only, no backup.
-// The temp name matches .gitignore's `.*.tmp-*`, so an interrupted write can't
-// show up as untracked noise in a user's project.
+// Temp file + rename in the same directory via atomicWriteFile (mirroring
+// writeYyp): a crash mid-write can't leave a truncated room .yy behind. Single
+// file atomicity only, no backup -- snapshots are the dispatch hook's job. The
+// temp name matches .gitignore's `.*.tmp-*`, so an interrupted write can't show
+// up as untracked noise in a user's project.
 export async function writeRoomYy(file: string, room: any): Promise<void> {
-  const tempPath = path.join(path.dirname(file), `.${path.basename(file)}.tmp-${crypto.randomUUID()}`);
-  try {
-    await fs.writeFile(tempPath, JSON.stringify(room, null, 2), "utf8");
-    await fs.rename(tempPath, file);
-  } catch (e: any) {
-    await fs.rm(tempPath, { force: true }).catch(() => {});
-    // Windows reports a rename over an open file as EPERM/EACCES -- in practice
-    // that means the IDE (or an antivirus scan) is holding this room open.
-    if (e?.code === "EPERM" || e?.code === "EACCES") {
-      throw new Error(
-        `Could not replace ${file}: ${e.code} -- the file is locked by another program. Close the room in GameMaker (or wait for the antivirus scan) and retry. (${e.message})`
-      );
-    }
-    throw e;
-  }
+  await atomicWriteFile(file, JSON.stringify(room, null, 2));
 }
 
 // Layer names are free text in GameMaker's room editor ("World Reality",

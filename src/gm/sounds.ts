@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
+import { atomicCopyFile, atomicWriteJson } from "./atomic.js";
 import { ensureFolder, ensureAudioGroup, validateResourceName, RESOURCE_VERSIONS, registerResource, parseGameMakerJson, assertSafeResourceName } from "./yyp.js";
 
 export interface SoundOptions {
@@ -161,7 +162,7 @@ export async function addSound(
   await fs.mkdir(dir, { recursive: true });
 
   const soundFileName = `${soundName}${ext}`;
-  await fs.copyFile(sourceFile, path.join(dir, soundFileName));
+  await atomicCopyFile(sourceFile, path.join(dir, soundFileName));
 
   const soundYy = {
     "$GMSound": "v2",
@@ -192,11 +193,7 @@ export async function addSound(
     volume: options.volume ?? 1.0
   };
 
-  await fs.writeFile(
-    path.join(dir, `${soundName}.yy`),
-    JSON.stringify(soundYy, null, 2),
-    "utf8"
-  );
+  await atomicWriteJson(path.join(dir, `${soundName}.yy`), soundYy);
 
   ensureFolder(yyp, "Sounds");
   ensureAudioGroup(yyp);
@@ -238,5 +235,5 @@ export async function editSound(
   if (options.volume !== undefined) sound.volume = options.volume;
   if (options.preload !== undefined) sound.preload = options.preload;
 
-  await fs.writeFile(yyPath, JSON.stringify(sound, null, 2), "utf8");
+  await atomicWriteJson(yyPath, sound);
 }

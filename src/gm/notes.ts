@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
+import { atomicWriteFile, atomicWriteJson } from "./atomic.js";
 import { ensureFolder, validateResourceName, RESOURCE_VERSIONS, registerResource } from "./yyp.js";
 
 // Notes are plain-text project documentation, never compiled into the game.
@@ -16,7 +17,7 @@ export async function addNote(
   const dir = path.join(projectDir, "notes", noteName);
   await fs.mkdir(dir, { recursive: true });
 
-  await fs.writeFile(path.join(dir, `${noteName}.txt`), content, "utf8");
+  await atomicWriteFile(path.join(dir, `${noteName}.txt`), content);
 
   const noteYy = {
     "$GMNotes": "",
@@ -30,11 +31,7 @@ export async function addNote(
     resourceVersion: RESOURCE_VERSIONS.note
   };
 
-  await fs.writeFile(
-    path.join(dir, `${noteName}.yy`),
-    JSON.stringify(noteYy, null, 2),
-    "utf8"
-  );
+  await atomicWriteJson(path.join(dir, `${noteName}.yy`), noteYy);
 
   ensureFolder(yyp, "Notes");
 

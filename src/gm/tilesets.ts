@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
+import { atomicWriteJson } from "./atomic.js";
 import { ensureFolder, ensureTextureGroup, validateResourceName, RESOURCE_VERSIONS, registerResource, parseGameMakerJson, assertSafeResourceName } from "./yyp.js";
 
 export interface TilesetOptions {
@@ -111,11 +112,7 @@ export async function addTileset(
 
   const files = tilesetFiles(projectDir, name);
   await fs.mkdir(files.dir, { recursive: true });
-  await fs.writeFile(
-    files.yyFile,
-    JSON.stringify(newTilesetYy(name, spriteName, spriteSize, tileWidth, tileHeight, options), null, 2),
-    "utf8"
-  );
+  await atomicWriteJson(files.yyFile, newTilesetYy(name, spriteName, spriteSize, tileWidth, tileHeight, options));
 
   ensureFolder(yyp, "Tilesets");
   ensureTextureGroup(yyp);
@@ -167,5 +164,5 @@ export async function editTileset(
   tileset.out_columns = columns;
   tileset.tile_count = columns * rows;
 
-  await fs.writeFile(yyFile, JSON.stringify(tileset, null, 2), "utf8");
+  await atomicWriteJson(yyFile, tileset);
 }

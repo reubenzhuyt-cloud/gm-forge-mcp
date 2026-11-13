@@ -1,6 +1,7 @@
 import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
+import { atomicWriteJson } from "./atomic.js";
 import { ensureFolder, registerResource, validateResourceName, RESOURCE_VERSIONS } from "./yyp.js";
 
 // Ground truth: a real GMParticleSystem captured from a published GameMaker
@@ -115,11 +116,7 @@ export async function addParticleSystem(projectDir: string, yyp: Yyp, name: stri
 
   const dir = path.join(projectDir, "particles", name);
   await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(
-    path.join(dir, `${name}.yy`),
-    JSON.stringify(newParticleSystemYy(name), null, 2),
-    "utf8"
-  );
+  await atomicWriteJson(path.join(dir, `${name}.yy`), newParticleSystemYy(name));
 
   ensureFolder(yyp, "Particles");
   registerResource(yyp, name, `particles/${name}/${name}.yy`);

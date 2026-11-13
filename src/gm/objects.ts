@@ -2,6 +2,7 @@ import { promises as fs } from "fs";
 import path from "path";
 import type { Yyp } from "@bscotch/yy";
 import type { EventDefinition } from "./types.js";
+import { atomicWriteFile, atomicWriteJson } from "./atomic.js";
 import { ensureFolder, registerResource, validateResourceName, parseGameMakerJson, assertSafeResourceName, RESOURCE_VERSIONS, fileExists } from "./yyp.js";
 
 interface ObjectFiles {
@@ -155,9 +156,9 @@ export async function addObject(projectDir: string, yyp: Yyp, name: string, even
   }
 
   await fs.mkdir(files.dir, { recursive: true });
-  await fs.writeFile(files.yyFile, JSON.stringify(newObjectYy(name, eventList), null, 2), "utf8");
+  await atomicWriteJson(files.yyFile, newObjectYy(name, eventList));
   for (const stubFileName of stubFileNames) {
-    await fs.writeFile(path.join(files.dir, stubFileName), "// Event code here\n", "utf8");
+    await atomicWriteFile(path.join(files.dir, stubFileName), "// Event code here\n");
   }
 
   ensureFolder(yyp, "Objects");
@@ -204,8 +205,8 @@ export async function addObjectEvent(
   }
 
   obj.eventList.push(eventEntry(event, await resolveCollisionTarget(projectDir, event)));
-  await fs.writeFile(files.yyFile, JSON.stringify(obj, null, 2), "utf8");
-  await fs.writeFile(path.join(files.dir, stubFileName), code, "utf8");
+  await atomicWriteJson(files.yyFile, obj);
+  await atomicWriteFile(path.join(files.dir, stubFileName), code);
 }
 
 export interface ObjectEditOptions {
@@ -414,6 +415,6 @@ export async function editObject(
   if (changes.length === 0) {
     return `✓ Object "${objectName}" unchanged -- no field differed from the requested values`;
   }
-  await fs.writeFile(files.yyFile, JSON.stringify(obj, null, 2), "utf8");
+  await atomicWriteJson(files.yyFile, obj);
   return `✓ Updated object "${objectName}": ${changes.join(", ")}`;
 }
