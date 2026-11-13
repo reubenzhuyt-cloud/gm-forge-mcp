@@ -9,6 +9,16 @@ export interface ReferenceHit {
 
 const SEARCHABLE_EXTENSIONS = [".yy", ".yyp", ".gml"];
 
+/**
+ * Hidden and tool-generated directories are not part of the project's
+ * resource graph: `.gamemaker-mcp` holds full copies of the project taken by
+ * a previous MCP (its backups/snapshots match every name in the project),
+ * and `.git`/`node_modules`/`.opencode` are noise. findReferences feeds
+ * rename_resource (which rewrites every file it returns) and
+ * delete_resource's safety check, so recursing into a backup tree would
+ * rewrite the backups themselves and inflate the reference count until
+ * nothing can be deleted.
+ */
 async function walkFiles(dir: string): Promise<string[]> {
   const results: string[] = [];
   let entries;
@@ -20,6 +30,7 @@ async function walkFiles(dir: string): Promise<string[]> {
   for (const entry of entries) {
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) {
+      if (entry.name.startsWith(".")) continue;
       results.push(...(await walkFiles(full)));
     } else if (SEARCHABLE_EXTENSIONS.includes(path.extname(entry.name))) {
       results.push(full);
