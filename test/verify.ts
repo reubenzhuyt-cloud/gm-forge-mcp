@@ -2852,6 +2852,14 @@ async function main() {
     /only reads files that already exist/.test(unknownPlatform)
     && unknownPlatform.includes(path.join("options", "switch", "options_switch.yy")), unknownPlatform);
 
+  // Every options fixture lands in the working tree with whatever core.autocrlf
+  // chose for this clone (CRLF on Windows, LF elsewhere), so line-level
+  // comparisons normalise the EOL first. The EOL style is then checked
+  // separately: a writer that silently converted line endings must still fail.
+  const normaliseEol = (text: string) => text.replace(/\r\n/g, "\n");
+  const splitNormalisedLines = (text: string) => normaliseEol(text).split("\n");
+  const crlfCount = (text: string) => (text.match(/\r\n/g) ?? []).length;
+
   // --- set_project_option ---
   const optionsBefore = new Map<string, string>();
   for (const platform of await fs.readdir(path.join(optionsDir, "options"))) {
@@ -2865,14 +2873,16 @@ async function main() {
     && flip.onDiskKey === "option_windows_interpolate_pixels" && flip.file === "options/windows/options_windows.yy"
     && flip.key === "interpolate_pixels", JSON.stringify(flip));
   const windowsAfter = await readOptionsFile(optionsDir, "windows");
-  const beforeLinesOf = windowsText.split("\n");
-  const afterLinesOf = windowsAfter.split("\n");
+  const beforeLinesOf = splitNormalisedLines(windowsText);
+  const afterLinesOf = splitNormalisedLines(windowsAfter);
   const changedLineIndexes = beforeLinesOf.map((line, i) => (line === afterLinesOf[i] ? -1 : i)).filter(i => i >= 0);
   ok("set_project_option: rewrites exactly one line, the one that holds the value",
     changedLineIndexes.length === 1
+    && afterLinesOf.length === beforeLinesOf.length
+    && crlfCount(windowsAfter) === crlfCount(windowsText)
     && afterLinesOf[changedLineIndexes[0]] === '  "option_windows_interpolate_pixels":true,'
     && beforeLinesOf[changedLineIndexes[0]] === '  "option_windows_interpolate_pixels":false,',
-    changedLineIndexes.map(i => `${i}: ${beforeLinesOf[i]} -> ${afterLinesOf[i]}`).join(" | "));
+    changedLineIndexes.map(i => `${i}: ${JSON.stringify(beforeLinesOf[i])} -> ${JSON.stringify(afterLinesOf[i])}`).join(" | "));
   ok("set_project_option: the file's byte length moves by exactly the value's length (nothing else re-serialised)",
     windowsAfter.length - windowsText.length === JSON.stringify(true).length - JSON.stringify(false).length,
     String(windowsAfter.length - windowsText.length));
@@ -2947,10 +2957,14 @@ async function main() {
 
   const authorBefore = await readOptionsFile(optionsDir, "main");
   const authorWrite = await setProjectOption(optionsDir, { platform: undefined, key: "option_author", value: "A Tester" });
-  const authorLines = (await readOptionsFile(optionsDir, "main")).split("\n");
+  const authorAfterText = await readOptionsFile(optionsDir, "main");
+  const authorLines = splitNormalisedLines(authorAfterText);
+  const authorBeforeLines = splitNormalisedLines(authorBefore);
   ok("set_project_option: a project-wide key defaults to options/main/ and rewrites only its own line",
     authorWrite.changed === true && authorWrite.platform === "Main" && authorWrite.onDiskKey === "option_author"
-    && authorLines.filter((line, i) => line !== authorBefore.split("\n")[i]).length === 1,
+    && authorLines.length === authorBeforeLines.length
+    && crlfCount(authorAfterText) === crlfCount(authorBefore)
+    && authorLines.filter((line, i) => line !== authorBeforeLines[i]).length === 1,
     JSON.stringify(authorWrite));
   const speedWrite = await setProjectOption(optionsDir, { key: "option_game_speed", value: 30 });
   ok("set_project_option: option_game_speed 60 -> 30 is an integer write to the main file",
