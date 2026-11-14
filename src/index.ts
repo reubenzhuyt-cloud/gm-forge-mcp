@@ -24,7 +24,7 @@ import { fileURLToPath } from "url";
 import { realpathSync } from "fs";
 import { addScript, editScript } from "./gm/scripts.js";
 import { addObject, addObjectEvent, editObject } from "./gm/objects.js";
-import { addSpriteFromImages, editSprite } from "./gm/sprites.js";
+import { addSpriteFromImages, editSprite, SPRITE_COLLISION_KINDS, SPRITE_BBOX_MODES, SPRITE_BBOX_KEYS, MANUAL_BBOX_MODE, describeSpriteCollisionKinds, describeSpriteBboxModes } from "./gm/sprites.js";
 import {
   listSpriteFrames,
   addSpriteFrame,
@@ -188,18 +188,97 @@ const GetSpriteInfoSchema = ProjectSchema.extend({
   spriteName: z.string().describe("Name of the sprite to inspect"),
 });
 
-const EditSpriteSchema = ProjectSchema.extend({
+// The two allowlists are the sprite module's (sprites.ts) so the tool schema and
+// the module cannot disagree about which values this tree can evidence.
+const SpriteCollisionKindSchema = z
+  .number()
+  .finite()
+  .int()
+  .refine(value => SPRITE_COLLISION_KINDS.includes(value), value => ({
+    message:
+      `collisionKind ${value} is not supported: the only values this tree can evidence are ` +
+      `${describeSpriteCollisionKinds()} -- no GameMaker sample on this machine uses any other mask kind`,
+  }));
+
+const SpriteBboxModeSchema = z
+  .number()
+  .finite()
+  .int()
+  .refine(value => SPRITE_BBOX_MODES.includes(value), value => ({
+    message:
+      `bboxMode ${value} is not supported: the only values this tree can evidence are ` +
+      `${describeSpriteBboxModes()}`,
+  }));
+
+const EditSpriteArgsSchema = ProjectSchema.extend({
   spriteName: z.string().describe("Name of the existing sprite to edit"),
-  xorigin: z.number().optional().describe("New origin X coordinate in pixels (also sets the origin preset to Custom)"),
-  yorigin: z.number().optional().describe("New origin Y coordinate in pixels (also sets the origin preset to Custom)"),
-  collisionKind: z.number().int().optional().describe("New collision mask kind (0=Precise, 1=Rectangle, 2=Ellipse, 3=Diamond, ...)"),
-  bboxMode: z.number().int().optional().describe("New bounding box mode (0=Automatic, 1=Full Image, 2=Manual)"),
-  bbox_left: z.number().optional().describe("New bounding box left edge (used when bboxMode=2)"),
-  bbox_top: z.number().optional().describe("New bounding box top edge (used when bboxMode=2)"),
-  bbox_right: z.number().optional().describe("New bounding box right edge (used when bboxMode=2)"),
-  bbox_bottom: z.number().optional().describe("New bounding box bottom edge (used when bboxMode=2)"),
+  xorigin: z
+    .number()
+    .finite()
+    .optional()
+    .describe("New origin X coordinate in pixels, 0..width inclusive (GameMaker allows an origin on the far edge). Also sets sequence.lockOrigin to false and the origin preset to Custom (9)"),
+  yorigin: z
+    .number()
+    .finite()
+    .optional()
+    .describe("New origin Y coordinate in pixels, 0..height inclusive. Also sets sequence.lockOrigin to false and the origin preset to Custom (9)"),
+  collisionKind: SpriteCollisionKindSchema.optional().describe(
+    `New collision mask kind. Accepted: ${describeSpriteCollisionKinds()} (every value a real GameMaker file on this machine uses; other enum members have no verified sample)`
+  ),
+  bboxMode: SpriteBboxModeSchema.optional().describe(
+    `New bounding box mode. Accepted: ${describeSpriteBboxModes()}. bbox_* is only stored under Manual (2)`
+  ),
+  bbox_left: z.number().finite().int().optional().describe("New bounding box left edge; requires bboxMode: 2 (Manual), 0 <= bbox_left < bbox_right <= width-1"),
+  bbox_top: z.number().finite().int().optional().describe("New bounding box top edge; requires bboxMode: 2 (Manual), 0 <= bbox_top < bbox_bottom <= height-1"),
+  bbox_right: z.number().finite().int().optional().describe("New bounding box right edge; requires bboxMode: 2 (Manual)"),
+  bbox_bottom: z.number().finite().int().optional().describe("New bounding box bottom edge; requires bboxMode: 2 (Manual)"),
   skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
-});
+}).strict();
+
+// A misspelled argument used to be dropped by zod silently, so `bboxRight` (or an
+// empty call) still rewrote the whole file and answered "updated". Strict, plus
+// the cross-field rule that manual bounds need Manual mode -- which the IDE
+// enforces by discarding them, not by refusing.
+const EditSpriteSchema = EditSpriteArgsSchema.refine(
+  value => SPRITE_BBOX_KEYS.every(key => value[key] === undefined) || value.bboxMode === MANUAL_BBOX_MODE,
+  {
+    message:
+      "bbox_left/bbox_top/bbox_right/bbox_bottom need bboxMode: 2 (Manual) -- the IDE discards manual bounds under Automatic (0) and Full Image (1) and recomputes the mask, so the numbers would never be read",
+    path: ["bboxMode"],
+  }
+);
+
+// The accepted-argument list has to survive the refine above (a ZodEffects has no
+// .shape), so the message is built from the strict object that defines them.
+function parseSpriteEditArgs(args: unknown): z.infer<typeof EditSpriteArgsSchema> {
+  const parsed = EditSpriteSchema.safeParse(args);
+  if (parsed.success) return parsed.data;
+  const unknown = parsed.error.issues.flatMap(issue =>
+    issue.code === "unrecognized_keys" ? issue.keys : []
+  );
+  const accepted = Object.keys(EditSpriteArgsSchema.shape).join(", ");
+  if (unknown.length > 0) {
+    throw new Error(
+      `edit_sprite does not accept ${unknown.map(key => `"${key}"`).join(", ")}. ` +
+        `Accepted arguments: ${accepted}. Nothing was written.`
+    );
+  }
+  throw new Error(
+    `invalid edit_sprite arguments: ${parsed.error.issues
+      .map(issue => `${issue.path.join(".") || "(arguments)"}: ${issue.message}`)
+      .join("; ")}. Nothing was written.`
+  );
+}
+
+
+// A call with no editable field can never write, so the snapshot hook must not
+// copy the project for it; the handler still answers with its own message.
+function spriteEditPrevalidate(args: any): string | null {
+  const editable = ["xorigin", "yorigin", "collisionKind", "bboxMode", ...SPRITE_BBOX_KEYS];
+  return editable.some(key => args?.[key] !== undefined)
+    ? null
+    : `edit_sprite needs at least one of ${editable.join(", ")}`;
+}
 
 // --- Sprite frames (subproject B) ---
 // A frame is two pngs (the composite and the per-layer copy), so every writer
@@ -516,11 +595,14 @@ const ObjectPhysicsSchema = z.object({
 
 const VariableDefinitionSchema = z.object({
   name: z.string().describe("Variable name as declared in the object's Variable Definitions panel"),
-  value: z.string().describe("Initial value as written in the panel (strings are unquoted)"),
+  value: z
+    .string()
+    .optional()
+    .describe("Initial value as written in the panel (strings are unquoted). Required for a name the object does not have yet; omitted for an existing definition leaves its value alone"),
   type: z
     .enum(["real", "asset"])
-    .default("real")
-    .describe("value type: \"real\" (varType 0) or \"asset\" (varType 4). Only these two have a verified .yy encoding, so any other type is rejected rather than guessed at"),
+    .optional()
+    .describe("value type: \"real\" (varType 0) or \"asset\" (varType 4). Only these two have a verified .yy encoding, so any other type is rejected rather than guessed at. Omitted keeps an existing definition's varType and defaults a new one to \"real\""),
 });
 
 const EditObjectSchema = ProjectSchema.extend({
@@ -536,7 +618,11 @@ const EditObjectSchema = ProjectSchema.extend({
     .array(VariableDefinitionSchema)
     .nullable()
     .optional()
-    .describe("Object variable definitions; [] or null empties the list, omitted leaves it unchanged"),
+    .describe("Object variable definitions, MERGED BY NAME into the object's existing properties: a definition listed here changes only the fields it supplies (name always, value/type only when given) and every other field -- rangeMax, rangeMin, filters, listItems, multiselect, varType -- is preserved. Definitions you do not mention are preserved too; [] or null therefore merge nothing. Delete with removeVariableDefinitions"),
+  removeVariableDefinitions: z
+    .array(z.string())
+    .optional()
+    .describe("Names of variable definitions to delete outright; a name the object does not have is an error. Definitions are never deleted implicitly"),
   skipSnapshot: z.boolean().optional().describe(SKIP_SNAPSHOT_DESCRIPTION),
 });
 
@@ -815,7 +901,7 @@ const TOOL_DEFS: ToolDef[] = [
   { name: "set_room_tiles", description: "Write individual tile cells (index -1 clears a cell). Every cell is validated before anything is written; a call that changes nothing leaves the file untouched.", schema: SetRoomTilesSchema },
   { name: "fill_room_tiles", description: "Fill an axis-aligned rectangle of a tile layer with one tile index, inclusive of its origin cell. Rectangles that run past the layer are errors, not silent clips.", schema: FillRoomTilesSchema },
   { name: "get_sprite_info", description: "Get detailed info about an existing sprite: real dimensions, frame count, origin, collision settings", schema: GetSpriteInfoSchema },
-  { name: "edit_sprite", description: "Edit an existing sprite's origin, collision kind, and/or bounding box -- not its frame data", schema: EditSpriteSchema },
+  { name: "edit_sprite", description: "Edit an existing sprite's origin, collision kind, and/or bounding box -- not its frame data. Only the changed lines are rewritten (the IDE's own formatting survives), an unchanged request writes nothing and says so, and a call that changes nothing takes no backup", schema: EditSpriteSchema, prevalidate: spriteEditPrevalidate },
   { name: "list_sprite_frames", description: "Read a sprite's frame list and its frames sequence: per-frame guid, png path and whether both copies exist, plus the sequence length, playback speed, keyframe count and a verdict (\"ok\" or \"frames-vs-sequence mismatch: N vs M\"). Read-only -- it reports a broken sprite instead of repairing it", schema: ListSpriteFramesSchema },
   { name: "add_sprite_frame", description: "Append or insert one frame from a PNG on disk (omitted index appends, 0..frameCount-1 inserts before that frame). The PNG must match the sprite's size -- there is no resize and no pixel editing -- and the new frame gets a fresh guid plus both png copies GameMaker expects. Never touches the .yyp or texture group", schema: AddSpriteFrameSchema, prevalidate: spriteFramePrevalidate.add_sprite_frame },
   { name: "remove_sprite_frame", description: "Remove one frame and delete both of its png copies, renumbering the remaining keyframes. Refuses the only frame of a sprite (delete the resource instead). Not a pixel edit: nothing else in the sprite changes", schema: RemoveSpriteFrameSchema, prevalidate: spriteFramePrevalidate.remove_sprite_frame },
@@ -987,10 +1073,10 @@ async function dispatchTool(name: string, args: unknown) {
       }
 
       case "edit_object": {
-        const { projectDir, objectName, spriteName, spriteMaskName, parentObjectName, solid, visible, persistent, physics, variableDefinitions } =
+        const { projectDir, objectName, spriteName, spriteMaskName, parentObjectName, solid, visible, persistent, physics, variableDefinitions, removeVariableDefinitions } =
           EditObjectSchema.parse(args);
         const text = await editObject(projectDir, objectName, {
-          spriteName, spriteMaskName, parentObjectName, solid, visible, persistent, physics, variableDefinitions,
+          spriteName, spriteMaskName, parentObjectName, solid, visible, persistent, physics, variableDefinitions, removeVariableDefinitions,
         });
         return { content: [{ type: "text", text }] };
       }
@@ -1160,9 +1246,9 @@ async function dispatchTool(name: string, args: unknown) {
       }
 
       case "edit_sprite": {
-        const { projectDir, spriteName, xorigin, yorigin, collisionKind, bboxMode, bbox_left, bbox_top, bbox_right, bbox_bottom } = EditSpriteSchema.parse(args);
-        await editSprite(projectDir, spriteName, { xorigin, yorigin, collisionKind, bboxMode, bbox_left, bbox_top, bbox_right, bbox_bottom });
-        return { content: [{ type: "text", text: `✓ Sprite "${spriteName}" updated` }] };
+        const { projectDir, spriteName, xorigin, yorigin, collisionKind, bboxMode, bbox_left, bbox_top, bbox_right, bbox_bottom } = parseSpriteEditArgs(args);
+        const text = await editSprite(projectDir, spriteName, { xorigin, yorigin, collisionKind, bboxMode, bbox_left, bbox_top, bbox_right, bbox_bottom });
+        return { content: [{ type: "text", text }] };
       }
 
       case "list_sprite_frames": {
@@ -1589,7 +1675,7 @@ function isEntryPoint(): boolean {
   }
 }
 
-export { TOOL_DEFS, ObjectPhysicsSchema, EditObjectSchema, AddRoomLayerSchema, dispatchTool, callTool };
+export { TOOL_DEFS, ObjectPhysicsSchema, EditObjectSchema, EditSpriteSchema, AddRoomLayerSchema, dispatchTool, callTool };
 
 if (isEntryPoint()) {
   main().catch((error) => {

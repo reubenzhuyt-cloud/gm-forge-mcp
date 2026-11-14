@@ -232,9 +232,10 @@ export interface ObjectEditOptions {
   };
   variableDefinitions?: Array<{
     name: string;
-    value: string;
+    value?: string;
     type?: "real" | "string" | "boolean" | "expression" | "asset";
   }> | null;
+  removeVariableDefinitions?: string[];
 }
 
 // Option names map onto the physics_* keys GameMaker actually writes (see
@@ -345,6 +346,123 @@ function variableDefinitionEntry(def: NonNullable<ObjectEditOptions["variableDef
   };
 }
 
+// A definition is identified by `name`; `%Name` carries the same string in every
+// real sample. Used for both the merge and the overriddenProperties check.
+function definitionNameOf(entry: any): string | undefined {
+  if (typeof entry?.name === "string") return entry.name;
+  if (typeof entry?.["%Name"] === "string") return entry["%Name"];
+  return undefined;
+}
+
+function definedNames(entries: any[]): string {
+  const names = entries.map(definitionNameOf).filter((name): name is string => typeof name === "string");
+  return names.length > 0 ? names.join(", ") : "(none)";
+}
+
+/**
+ * `properties` is the object's Variable Definitions panel, and the IDE stores a
+ * lot in each entry that no caller supplies: rangeMax is the slider maximum the
+ * user picked (obj_lv3_portal has 1344 and 1.0 on two definitions), listItems /
+ * filters / multiselect are its dropdown setup. Replacing the array therefore
+ * rewrote those the moment any definition was edited. This merges by name
+ * instead: a supplied definition touches only the fields it carries, every
+ * other entry is preserved in place and in order, and removal is explicit.
+ */
+function mergeVariableDefinitions(
+  obj: any,
+  objectName: string,
+  defs: NonNullable<ObjectEditOptions["variableDefinitions"]>,
+  removeNames: string[],
+  changes: string[]
+): void {
+  const existing: any[] = Array.isArray(obj.properties) ? obj.properties : [];
+  const before = JSON.stringify(existing);
+
+  const removeSet = new Set<string>();
+  for (const rawName of removeNames) {
+    if (typeof rawName !== "string" || rawName.length === 0) {
+      throw new Error(`removeVariableDefinitions must be variable definition names, got ${JSON.stringify(rawName)}`);
+    }
+    if (removeSet.has(rawName)) {
+      throw new Error(`removeVariableDefinitions lists "${rawName}" twice on object "${objectName}"`);
+    }
+    if (!existing.some(entry => definitionNameOf(entry) === rawName)) {
+      throw new Error(
+        `Object "${objectName}" has no variable definition "${rawName}" to remove (it has: ${definedNames(existing)}). Nothing was written.`
+      );
+    }
+    removeSet.add(rawName);
+  }
+
+  const suppliedNames = new Set<string>();
+  for (const def of defs) {
+    if (typeof def?.name !== "string" || def.name.length === 0) {
+      throw new Error(`every variable definition needs a name (got ${JSON.stringify(def?.name)})`);
+    }
+    if (suppliedNames.has(def.name)) {
+      throw new Error(`Duplicate variable definition "${def.name}" on object "${objectName}"`);
+    }
+    suppliedNames.add(def.name);
+    // Refuse an unverified varType before anything is mutated, even when the
+    // definition turns out to be an update that would not carry the type.
+    if (def.type !== undefined) variableDefinitionVarType(def.type);
+    if (removeSet.has(def.name)) {
+      throw new Error(
+        `Variable definition "${def.name}" on object "${objectName}" is both updated and removed; pass it in only one of the two lists. Nothing was written.`
+      );
+    }
+    if (def.value === undefined && !existing.some(entry => definitionNameOf(entry) === def.name)) {
+      throw new Error(
+        `New variable definition "${def.name}" on object "${objectName}" needs a value -- there is no existing definition to merge into. Nothing was written.`
+      );
+    }
+  }
+
+  // A removed definition that overriddenProperties still points at would leave
+  // the child-object override dangling; refuse before the array changes.
+  if (removeSet.size > 0 && Array.isArray(obj.overriddenProperties)) {
+    const dangling = (obj.overriddenProperties as any[])
+      .map(definitionNameOf)
+      .filter((name): name is string => typeof name === "string" && removeSet.has(name));
+    if (dangling.length > 0) {
+      throw new Error(
+        `refusing to remove variable definition(s) ${[...new Set(dangling)].join(", ")} from object "${objectName}": ` +
+          `overriddenProperties still references ${dangling.length === 1 ? "it" : "them"}. Nothing was written.`
+      );
+    }
+  }
+
+  const next = existing.slice();
+  for (const name of removeSet) {
+    const index = next.findIndex(entry => definitionNameOf(entry) === name);
+    next.splice(index, 1);
+    changes.push(`properties -${name}`);
+  }
+
+  for (const def of defs) {
+    const entry = next.find(candidate => definitionNameOf(candidate) === def.name);
+    if (!entry) {
+      next.push(variableDefinitionEntry(def));
+      changes.push(`properties +${def.name}`);
+      continue;
+    }
+    if (def.value !== undefined && entry.value !== def.value) {
+      entry.value = def.value;
+      changes.push(`properties ${def.name}.value=${def.value}`);
+    }
+    if (def.type !== undefined) {
+      const varType = variableDefinitionVarType(def.type);
+      if (entry.varType !== varType) {
+        entry.varType = varType;
+        changes.push(`properties ${def.name}.varType=${varType}`);
+      }
+    }
+  }
+
+  // `properties` is always an array -- GameMaker has no null form of it.
+  if (JSON.stringify(next) !== before) obj.properties = next;
+}
+
 /**
  * Edits one existing object's own .yy in place: sprite/mask/parent refs,
  * solidity/visibility/persistence, the physics block, and object variable
@@ -352,7 +470,10 @@ function variableDefinitionEntry(def: NonNullable<ObjectEditOptions["variableDef
  * touch keep their original order and values.
  *
  * undefined leaves a field alone, null clears a reference (spriteMaskId,
- * parentObjectId) or empties the variable definitions.
+ * parentObjectId). `variableDefinitions` is a merge by name -- it never deletes,
+ * because the fields it does not carry (rangeMax, listItems, filters) are the
+ * user's own panel setup; deletion is only ever the explicit
+ * `removeVariableDefinitions` list.
  */
 export async function editObject(
   projectDir: string,
@@ -395,21 +516,14 @@ export async function editObject(
   if (opts.physics !== undefined) {
     applyPhysics(obj, opts.physics, changes);
   }
-  if (opts.variableDefinitions !== undefined) {
-    const next = opts.variableDefinitions === null ? [] : opts.variableDefinitions.map(variableDefinitionEntry);
-    const seen = new Set<string>();
-    for (const entry of next) {
-      if (seen.has(entry.name)) {
-        throw new Error(`Duplicate variable definition "${entry.name}" on object "${objectName}"`);
-      }
-      seen.add(entry.name);
-    }
-    // `properties` is always an array -- GameMaker has no null form of it,
-    // so clearing means an empty list.
-    if (JSON.stringify(obj.properties ?? null) !== JSON.stringify(next)) {
-      obj.properties = next;
-      changes.push(`properties=${next.length} definition${next.length === 1 ? "" : "s"}`);
-    }
+  if (opts.variableDefinitions !== undefined || opts.removeVariableDefinitions !== undefined) {
+    mergeVariableDefinitions(
+      obj,
+      objectName,
+      opts.variableDefinitions ?? [],
+      opts.removeVariableDefinitions ?? [],
+      changes
+    );
   }
 
   if (changes.length === 0) {

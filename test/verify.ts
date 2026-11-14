@@ -32,7 +32,7 @@ import { listRoomLayers, addRoomLayer, removeRoomLayer, setRoomLayer } from "../
 import { encodeTileData, MAX_TILE_RUN, getRoomTiles, setRoomTiles, fillRoomTiles } from "../src/gm/room_tiles.js";
 // src/index.ts is import-safe: it only opens the stdio transport when it is the
 // process entry point, so the suite can assert on the real registry and schemas.
-import { TOOL_DEFS, EditObjectSchema, callTool } from "../src/index.js";
+import { TOOL_DEFS, EditObjectSchema, EditSpriteSchema, callTool } from "../src/index.js";
 import { createSnapshot, listSnapshots, restoreSnapshot, deleteSnapshot, undoLast, readManifest, SNAPSHOT_KEEP, SNAPSHOT_MAX_FILE_BYTES, diffAgainstSnapshot } from "../src/gm/snapshot.js";
 import { readFile, patchFile, listChanges, READ_MAX_BYTES } from "../src/gm/files.js";
 import { AUTO_SNAPSHOT_TOOLS, withAutoSnapshot } from "../src/gm/write.js";
@@ -1387,14 +1387,18 @@ async function main() {
     varDefObj.properties[0].name === "target_room" && varDefObj.properties[0].value === "rm_lv2"
     && varDefObj.properties[0]["%Name"] === "target_room");
 
+  // Contract change (variable definitions merge instead of replacing): `null` no
+  // longer empties the list, because nothing may be deleted implicitly -- the
+  // explicit removal list is the only way, and the result is still an empty array
+  // (GameMaker has no null form of `properties`).
   await editObject(dir, "objTest", {
     spriteName: null, spriteMaskName: null, parentObjectName: null,
-    solid: false, visible: true, variableDefinitions: null,
+    solid: false, visible: true, removeVariableDefinitions: ["target_room", "target_x"],
   });
   const clearedObj = JSON.parse(await fs.readFile(editObjPath, "utf8"));
   ok("edit_object: null clears sprite, mask and parent",
     clearedObj.spriteId === null && clearedObj.spriteMaskId === null && clearedObj.parentObjectId === null);
-  ok("edit_object: null variableDefinitions empties properties (never a null list)",
+  ok("edit_object: removeVariableDefinitions empties properties to an array (never a null list)",
     Array.isArray(clearedObj.properties) && clearedObj.properties.length === 0);
   ok("edit_object: flags cleared", clearedObj.solid === false && clearedObj.visible === true);
 
@@ -4779,6 +4783,253 @@ async function main() {
     dOrderManifest !== null && !("undoHold" in (dOrderManifest as any)),
     JSON.stringify(Object.keys(dOrderManifest ?? {})));
 
+  // ===== edit_sprite hardening =====
+  // Three defects the harness reproduced on a pristine IDE file: an empty (or
+  // misspelled) call rewrote the whole .yy and answered "updated"; every write
+  // restyled the file (JSON.stringify(obj, null, 2) vs the IDE's `"k":v,` +
+  // trailing commas + 1.0 floats); and nothing was validated, so a non-finite
+  // number landed as JSON null and impossible masks/bounds were accepted.
+  const hardSpriteDir = await makeBareProject();
+  let hardSpriteYyp = await loadYyp(hardSpriteDir);
+  const hardFramesDir = path.join(hardSpriteDir, "_frames_src");
+  await fs.mkdir(hardFramesDir, { recursive: true });
+  await fs.copyFile(path.join(fixturesPath, "frame0.png"), path.join(hardFramesDir, "frame0.png"));
+  hardSpriteYyp = await addSpriteFromImages(hardSpriteDir, hardSpriteYyp, "sprIde", hardFramesDir);
+  await writeYyp(hardSpriteDir, hardSpriteYyp);
+  const ideSpritePath = path.join(hardSpriteDir, "sprites/sprIde/sprIde.yy");
+  // Turn the generated file into the shape a real GameMaker file has: no space
+  // after the colon, a trailing comma on every member, and a float where the IDE
+  // writes one (`"opacity":100.0`) -- built from our own fixture so nothing here
+  // reads or writes the read-only sample project.
+  const ideStyled = (text: string) =>
+    text
+      .replace(/": /g, '":')
+      .replace(/(\r?\n[ \t]*)([\]}])/g, "$1,$2")
+      .replace('"opacity":100,', '"opacity":100.0,')
+      .replace('"lockOrigin":false,', '"lockOrigin":true,');
+  await fs.writeFile(ideSpritePath, ideStyled(await fs.readFile(ideSpritePath, "utf8")), "utf8");
+  const ideSpriteBytes = await fs.readFile(ideSpritePath);
+  const ideSpriteStat = await fs.stat(ideSpritePath);
+
+  const emptySpriteCall = await callTool("edit_sprite", { projectDir: hardSpriteDir, spriteName: "sprIde" });
+  const emptySpriteText = textOf(emptySpriteCall);
+  ok("edit_sprite: an empty call writes nothing (bytes and mtime unchanged) and never reports an update",
+    !(emptySpriteCall as any).isError && (await fs.readFile(ideSpritePath)).equals(ideSpriteBytes)
+    && (await fs.stat(ideSpritePath)).mtimeMs === ideSpriteStat.mtimeMs
+    && !/updated/i.test(emptySpriteText), emptySpriteText);
+  ok("edit_sprite: an empty call answers that the sprite is already in the requested state",
+    /already in the requested state/.test(emptySpriteText), emptySpriteText);
+  ok("edit_sprite: an empty call takes no backup (nothing could have changed)",
+    (await snapshotCount(hardSpriteDir)) === 0, String(await snapshotCount(hardSpriteDir)));
+
+  for (const badKey of ["bboxRight", "origin", "collisionKindX"]) {
+    const badCall = await callTool("edit_sprite", { projectDir: hardSpriteDir, spriteName: "sprIde", [badKey]: 1 });
+    const badText = textOf(badCall);
+    ok(`edit_sprite: the unknown argument "${badKey}" is refused, naming it and the accepted arguments`,
+      (badCall as any).isError === true && badText.includes(`"${badKey}"`)
+      && badText.includes("Accepted arguments:") && badText.includes("bbox_right")
+      && badText.includes("skipSnapshot"),
+      badText);
+  }
+  ok("edit_sprite: the refused unknown-argument calls left the .yy byte-identical",
+    (await fs.readFile(ideSpritePath)).equals(ideSpriteBytes));
+
+  const infiniteSchema = EditSpriteSchema.safeParse({ projectDir: hardSpriteDir, spriteName: "sprIde", xorigin: Infinity });
+  const infiniteSchemaText = infiniteSchema.success
+    ? "schema accepted Infinity"
+    : (infiniteSchema.error?.issues ?? []).map((issue: any) => issue.message).join("; ");
+  ok("edit_sprite: the tool schema refuses a non-finite origin (JSON.stringify would have written null)",
+    !infiniteSchema.success && /finite/i.test(infiniteSchemaText), infiniteSchemaText);
+  const infiniteModuleText = await errorOf(() => editSprite(hardSpriteDir, "sprIde", { xorigin: Infinity }));
+  ok("edit_sprite: the module refuses Infinity too and writes nothing",
+    /finite number/.test(infiniteModuleText) && (await fs.readFile(ideSpritePath)).equals(ideSpriteBytes),
+    infiniteModuleText);
+
+  const spriteRejections: Array<[string, any, RegExp]> = [
+    ["collisionKind 99", { collisionKind: 99 }, /collisionKind 99 is not supported/],
+    ["bboxMode 7", { bboxMode: 7 }, /bboxMode 7 is not supported/],
+    ["a bbox_right past the frame", { bboxMode: 2, bbox_right: 999 }, /does not fit sprite "sprIde"/],
+    ["a negative origin", { xorigin: -5 }, /xorigin -5 is outside 0\.\.16/],
+    ["an origin past the far edge", { xorigin: 17 }, /xorigin 17 is outside 0\.\.16/],
+    ["an inverted bbox (bbox_left 15 > bbox_right 0)", { bboxMode: 2, bbox_left: 15, bbox_right: 0 }, /empty or inverted/],
+    ["bbox_* without bboxMode 2", { bbox_left: 1, bbox_top: 1, bbox_right: 2, bbox_bottom: 2 }, /need bboxMode 2 \(Manual\)/],
+  ];
+  for (const [label, args, expected] of spriteRejections) {
+    const message = await errorOf(() => editSprite(hardSpriteDir, "sprIde", args));
+    ok(`edit_sprite: ${label} is refused and says why`, expected.test(message), message);
+  }
+  ok("edit_sprite: every refused request left the .yy byte-identical and took no backup",
+    (await fs.readFile(ideSpritePath)).equals(ideSpriteBytes) && (await snapshotCount(hardSpriteDir)) === 0);
+
+  const beforeEditText = await fs.readFile(ideSpritePath, "utf8");
+  const beforeEditLines = beforeEditText.split("\n");
+  const originEditText = await callTool("edit_sprite", { projectDir: hardSpriteDir, spriteName: "sprIde", xorigin: 8 });
+  const afterEditText = await fs.readFile(ideSpritePath, "utf8");
+  const afterEditLines = afterEditText.split("\n");
+  const changedLineKeys = afterEditLines
+    .map((line, i) => (line === beforeEditLines[i] ? null : (/^\s*"([^"]+)"/.exec(line) ?? [])[1] ?? "(no key)"))
+    .filter((key): key is string => key !== null)
+    .sort();
+  ok("edit_sprite: a real edit changes only the lines it has to (origin, xorigin, lockOrigin)",
+    afterEditLines.length === beforeEditLines.length
+    && changedLineKeys.join(",") === "lockOrigin,origin,xorigin", changedLineKeys.join(","));
+  const originEdited = parseGameMakerJson(afterEditText);
+  ok("edit_sprite: xorigin applied, the origin preset set to Custom (9) and sequence.lockOrigin unlocked",
+    originEdited.sequence.xorigin === 8 && originEdited.origin === 9 && originEdited.sequence.lockOrigin === false,
+    JSON.stringify({ xorigin: originEdited.sequence.xorigin, origin: originEdited.origin, lockOrigin: originEdited.sequence.lockOrigin }));
+  ok("edit_sprite: the edited lines keep the IDE's own style (no space after the colon, trailing comma)",
+    afterEditText.includes('"xorigin":8,') && afterEditText.includes('"origin":9,') && afterEditText.includes('"lockOrigin":false,')
+    && afterEditText.includes('"opacity":100.0,'), JSON.stringify(afterEditLines.filter((line) => /xorigin|lockOrigin|"origin"/.test(line))));
+  ok("edit_sprite: every untouched byte survives the edit (trailing commas, 1.0 floats, key order)",
+    beforeEditLines.filter((line) => !/xorigin|lockOrigin|"origin"/.test(line))
+      .every((line, i) => line === afterEditLines.filter((l) => !/xorigin|lockOrigin|"origin"/.test(l))[i]));
+  ok("edit_sprite: the reply says what changed", /Updated sprite "sprIde"/.test(textOf(originEditText))
+    && /xorigin=8/.test(textOf(originEditText)), textOf(originEditText));
+
+  const settledBytes = await fs.readFile(ideSpritePath);
+  const settledStat = await fs.stat(ideSpritePath);
+  const settledCall = await callTool("edit_sprite", { projectDir: hardSpriteDir, spriteName: "sprIde", xorigin: 8 });
+  ok("edit_sprite: re-sending the values already on disk writes nothing and is not reported as an update",
+    !/updated/i.test(textOf(settledCall)) && (await fs.readFile(ideSpritePath)).equals(settledBytes)
+    && (await fs.stat(ideSpritePath)).mtimeMs === settledStat.mtimeMs, textOf(settledCall));
+
+  // A non-origin edit must leave the origin preset AND a locked origin alone.
+  await fs.writeFile(ideSpritePath, (await fs.readFile(ideSpritePath, "utf8")).replace('"lockOrigin":false,', '"lockOrigin":true,'), "utf8");
+  const lockedBefore = await fs.readFile(ideSpritePath, "utf8");
+  await editSprite(hardSpriteDir, "sprIde", { bboxMode: 1 });
+  const lockedAfter = await fs.readFile(ideSpritePath, "utf8");
+  const lockedLines = lockedAfter.split("\n");
+  const lockedOriginBefore = lockedBefore.split("\n");
+  ok("edit_sprite: an edit that is not an origin edit leaves sequence.lockOrigin and the origin preset untouched",
+    lockedAfter.includes('"lockOrigin":true,') && lockedAfter.includes('"origin":9,')
+    && lockedLines.filter((line, i) => line !== lockedOriginBefore[i]).length === 1
+    && lockedAfter.includes('"bboxMode":1,'),
+    JSON.stringify(lockedLines.filter((line, i) => line !== lockedOriginBefore[i])));
+
+  await expectThrows("edit_sprite: rejects a sprite that does not exist",
+    () => editSprite(hardSpriteDir, "sprDoesNotExist", { xorigin: 0 }));
+
+  // ===== edit_object: variableDefinitions merges by name =====
+  // The entry shapes and numbers below come from a real IDE-authored object
+  // (261103GJ/objects/obj_lv3_portal/obj_lv3_portal.yy:33-37): rangeMax 1344.0 /
+  // 1.0 / 800.0 / 255.0 / 999.0 and varType 4|0. Replacing the array rewrote
+  // every one of those to the hardcoded default 10.0.
+  const mergeDir = await makeBareProject();
+  let mergeYyp = await loadYyp(mergeDir);
+  mergeYyp = await addObject(mergeDir, mergeYyp, "objPortal", []);
+  await writeYyp(mergeDir, mergeYyp);
+  const mergeObjPath = path.join(mergeDir, "objects/objPortal/objPortal.yy");
+  const portalSeed = JSON.parse(await fs.readFile(mergeObjPath, "utf8"));
+  const portalProperty = (name: string, value: string, varType: number, rangeMax: number, extra: any = {}) => ({
+    $GMObjectProperty: "v2",
+    "%Name": name,
+    filters: [] as any[],
+    listItems: [] as any[],
+    multiselect: false,
+    name,
+    rangeEnabled: false,
+    rangeMax,
+    rangeMin: 0.0,
+    resourceType: "GMObjectProperty",
+    resourceVersion: "2.0",
+    value,
+    varType,
+    ...extra,
+  });
+  portalSeed.properties = [
+    portalProperty("target_room", "rm_lv3_1", 4, 1.0, { editorNote: "hand-added" }),
+    portalProperty("target_x", "-1", 0, 1344.0),
+    portalProperty("target_y", "-1", 0, 800.0),
+    portalProperty("need_key", "0", 0, 255.0),
+    portalProperty("door_id", "0", 0, 999.0, {
+      rangeEnabled: true,
+      multiselect: true,
+      listItems: [{ name: "a", value: "0" }, { name: "b", value: "1" }],
+      filters: [{ filterMax: 3, filterMin: 0, filterType: 0 }],
+    }),
+  ];
+  await fs.writeFile(mergeObjPath, JSON.stringify(portalSeed, null, 2), "utf8");
+  const seedByName = (name: string) => portalSeed.properties.find((entry: any) => entry.name === name);
+  const portalBefore = JSON.parse(JSON.stringify(seedByName("target_x")));
+  const doorBefore = JSON.parse(JSON.stringify(seedByName("door_id")));
+  const roomBefore = JSON.parse(JSON.stringify(seedByName("target_room")));
+
+  await editObject(mergeDir, "objPortal", { variableDefinitions: [{ name: "target_x", value: "5" }] });
+  const mergedObj = JSON.parse(await fs.readFile(mergeObjPath, "utf8"));
+  const mergedByName = (name: string) => mergedObj.properties.find((entry: any) => entry.name === name);
+  const withoutValue = (entry: any) => {
+    const copy = { ...entry };
+    delete copy.value;
+    return JSON.stringify(copy);
+  };
+  ok("edit_object: a merged definition changes only the supplied field and preserves every other one byte-for-byte",
+    mergedByName("target_x").value === "5" && withoutValue(mergedByName("target_x")) === withoutValue(portalBefore),
+    `${JSON.stringify(mergedByName("target_x"))} vs ${JSON.stringify(portalBefore)}`);
+  ok("edit_object: the merge preserves rangeMax 1344 (not the hardcoded 10)",
+    mergedByName("target_x").rangeMax === 1344, String(mergedByName("target_x").rangeMax));
+  ok("edit_object: definitions the call does not mention survive untouched (dropdown listItems, filters, multiselect, rangeEnabled)",
+    JSON.stringify(mergedByName("door_id")) === JSON.stringify(doorBefore), JSON.stringify(mergedByName("door_id")));
+  ok("edit_object: an unknown extra key on an untouched definition survives",
+    JSON.stringify(mergedByName("target_room")) === JSON.stringify(roomBefore)
+    && mergedByName("target_room").editorNote === "hand-added");
+  ok("edit_object: the merge keeps the definitions in their original order and never appends duplicates",
+    mergedObj.properties.map((entry: any) => entry.name).join(",") === "target_room,target_x,target_y,need_key,door_id",
+    mergedObj.properties.map((entry: any) => entry.name).join(","));
+
+  const mergeNoopBytes = await fs.readFile(mergeObjPath);
+  const mergeNoopText = await editObject(mergeDir, "objPortal", { variableDefinitions: [{ name: "target_x", value: "5" }] });
+  ok("edit_object: re-sending an identical definition writes nothing",
+    (await fs.readFile(mergeObjPath)).equals(mergeNoopBytes) && /unchanged/.test(mergeNoopText), mergeNoopText);
+  const nullMergeText = await editObject(mergeDir, "objPortal", { variableDefinitions: null });
+  ok("edit_object: variableDefinitions null/[] merge nothing and delete nothing -- deletion must be explicit",
+    (await fs.readFile(mergeObjPath)).equals(mergeNoopBytes) && /unchanged/.test(nullMergeText)
+    && JSON.parse(await fs.readFile(mergeObjPath, "utf8")).properties.length === 5, nullMergeText);
+
+  await editObject(mergeDir, "objPortal", { variableDefinitions: [{ name: "spawn_count", value: "3" }] });
+  const addedObj = JSON.parse(await fs.readFile(mergeObjPath, "utf8"));
+  const added = addedObj.properties.find((entry: any) => entry.name === "spawn_count");
+  ok("edit_object: a new definition keeps today's defaults and is appended",
+    addedObj.properties.length === 6 && addedObj.properties[5].name === "spawn_count"
+    && added.rangeEnabled === false && added.rangeMax === 10 && added.rangeMin === 0
+    && Array.isArray(added.listItems) && added.listItems.length === 0
+    && Array.isArray(added.filters) && added.filters.length === 0
+    && added.multiselect === false && added.varType === 0 && added.value === "3"
+    && keysMatchRef(added, REF.objectProperty),
+    JSON.stringify(added));
+  ok("edit_object: a new definition without a value is refused (there is nothing to merge into)",
+    /needs a value/.test(await errorOf(() => editObject(mergeDir, "objPortal", { variableDefinitions: [{ name: "no_value" }] }))));
+
+  await editObject(mergeDir, "objPortal", { variableDefinitions: [{ name: "target_y", type: "asset" }] });
+  const retyped = JSON.parse(await fs.readFile(mergeObjPath, "utf8"));
+  const targetY = retyped.properties.find((entry: any) => entry.name === "target_y");
+  ok("edit_object: a type-only definition updates varType without touching the value",
+    targetY.varType === 4 && targetY.value === "-1" && targetY.rangeMax === 800, JSON.stringify(targetY));
+
+  await editObject(mergeDir, "objPortal", { removeVariableDefinitions: ["need_key"] });
+  const removedObj = JSON.parse(await fs.readFile(mergeObjPath, "utf8"));
+  ok("edit_object: removeVariableDefinitions deletes only the named definition",
+    removedObj.properties.map((entry: any) => entry.name).join(",") === "target_room,target_x,target_y,door_id,spawn_count",
+    removedObj.properties.map((entry: any) => entry.name).join(","));
+  const missingRemoval = await errorOf(() => editObject(mergeDir, "objPortal", { removeVariableDefinitions: ["nope"] }));
+  ok("edit_object: removing a definition the object does not have is refused, naming it and the ones it has",
+    /no variable definition "nope"/.test(missingRemoval) && missingRemoval.includes("door_id"), missingRemoval);
+
+  // overriddenProperties is empty in every object on disk, so the reference shape
+  // is read tolerantly (`name` or `%Name`); a dangling override must not be
+  // created by a removal.
+  const overrideSeed = JSON.parse(await fs.readFile(mergeObjPath, "utf8"));
+  overrideSeed.overriddenProperties = [
+    { $GMObjectProperty: "v2", "%Name": "door_id", name: "door_id", resourceType: "GMObjectProperty", resourceVersion: "2.0" },
+  ];
+  await fs.writeFile(mergeObjPath, JSON.stringify(overrideSeed, null, 2), "utf8");
+  const overrideBytes = await fs.readFile(mergeObjPath);
+  const danglingRefusal = await errorOf(() => editObject(mergeDir, "objPortal", { removeVariableDefinitions: ["door_id"] }));
+  ok("edit_object: removing a definition overriddenProperties still references is refused, naming it",
+    /overriddenProperties still references it/.test(danglingRefusal) && danglingRefusal.includes("door_id")
+    && (await fs.readFile(mergeObjPath)).equals(overrideBytes), danglingRefusal);
+  ok("edit_object: the refused removal left the object byte-identical",
+    (await fs.readFile(mergeObjPath)).equals(overrideBytes));
+
   // --- item 8: registry hardening, globally ---
   const dAllNames = TOOL_DEFS.map((d) => d.name);
   const dBadNames = dAllNames.filter((name) => !/^[a-z][a-z0-9_]*$/.test(name));
@@ -4813,6 +5064,8 @@ async function main() {
   await fs.rm(retentionDir, { recursive: true, force: true });
 
   await fs.rm(dir, { recursive: true, force: true });
+  await fs.rm(hardSpriteDir, { recursive: true, force: true });
+  await fs.rm(mergeDir, { recursive: true, force: true });
 
   console.log(`\n${passed} passed, ${failed} failed, ${skipped} skipped`);
   if (skipped > 0) {
